@@ -1104,6 +1104,10 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
   const heat   = s.cost > avgCost*3 ? 'step-hot' : s.cost > avgCost*1.5 ? 'step-warm' : '';
   const expanded = isOpen ? 'expanded' : '';
 
+  // Check if this step has errors
+  const hasError = s.toolResults?.some(tr => tr.isError) || false;
+  const errorBadge = hasError ? '<span class="err-badge" style="margin-left:4px">ERROR</span>' : '';
+
   let actionCell = '—';
   if (s.toolCalls?.length) {
     const descs = s.toolCalls.map(tc => {
@@ -1111,7 +1115,7 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
       const cls = toolChipClass(tc.name);
       return \`<span class="tf-chip \${cls}" style="font-size:9px;padding:0 4px">\${d}</span>\`;
     });
-    actionCell = descs.slice(0,3).join(' ') + (descs.length>3 ? \` <span class="m">+\${descs.length-3}</span>\` : '');
+    actionCell = descs.slice(0,3).join(' ') + (descs.length>3 ? \` <span class="m">+\${descs.length-3}</span>\` : '') + errorBadge;
   }
 
   const mainRow = \`<tr class="step-row \${heat} \${expanded}" onclick="toggleStep(\${hbIdx},\${si})">
