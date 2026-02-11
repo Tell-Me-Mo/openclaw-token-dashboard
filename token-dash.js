@@ -1259,12 +1259,51 @@ function clearCompare() {
   if (a) renderAgent(a);
 }
 
+// ── URL hash navigation ───────────────────────────────────────────────────────
+function updateHash() {
+  if (!selectedId) {
+    history.replaceState(null, '', '#');
+    return;
+  }
+  let hash = \`#agent=\${selectedId}\`;
+  if (openHbIdx !== null) hash += \`&hb=\${openHbIdx}\`;
+  history.replaceState(null, '', hash);
+}
+
+function parseHash() {
+  const hash = window.location.hash.slice(1);
+  if (!hash) return { agent: null, hb: null };
+  const params = {};
+  for (const pair of hash.split('&')) {
+    const [k, v] = pair.split('=');
+    params[k] = v;
+  }
+  return { agent: params.agent || null, hb: params.hb !== undefined ? parseInt(params.hb, 10) : null };
+}
+
+function restoreFromHash() {
+  const { agent, hb } = parseHash();
+  if (agent && DATA) {
+    const a = DATA.agents.find(x => x.id === agent);
+    if (a) {
+      selectedId = agent;
+      openHbIdx = hb;
+      renderSidebar();
+      renderAgent(a);
+      if (hb !== null) {
+        setTimeout(() => document.getElementById(\`hb\${hb}\`)?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }), 100);
+      }
+    }
+  }
+}
+
 // ── Interactions ──────────────────────────────────────────────────────────────
 function select(id) {
   selectedId = id;
   openHbIdx  = null;
   compareMode = false;
   compareHbs = [];
+  updateHash();
   renderSidebar();
   if (!DATA) return;
   const a = DATA.agents.find(a=>a.id===id);
@@ -1287,6 +1326,7 @@ function toggleHb(i) {
 
   // Normal mode: toggle open/close
   openHbIdx = openHbIdx===i ? null : i;
+  updateHash();
   if (!expandedSteps[i]) expandedSteps[i] = new Set();
   if (!DATA) return;
   const a = DATA.agents.find(a=>a.id===selectedId);
@@ -1346,7 +1386,11 @@ async function fetchData() {
       bWrap.style.display = '';
     }
 
-    if (selectedId) {
+    // Restore from URL hash if present, otherwise use current state
+    const { agent, hb } = parseHash();
+    if (agent && !selectedId) {
+      restoreFromHash();
+    } else if (selectedId) {
       const a = DATA.agents.find(a=>a.id===selectedId);
       if (a) renderAgent(a);
     } else {
@@ -1362,6 +1406,11 @@ async function fetchData() {
 
 fetchData();
 setInterval(fetchData, 30000);
+
+// Handle browser back/forward
+window.addEventListener('popstate', () => {
+  if (DATA) restoreFromHash();
+});
 </script>
 </body>
 </html>`;
