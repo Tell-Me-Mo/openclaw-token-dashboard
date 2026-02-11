@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // OpenClaw Token Dashboard
+// Repository: https://github.com/Tell-Me-Mo/openclaw-token-dashboard
 // Usage: node ~/.openclaw/canvas/token-dash.js
 // Then open: http://localhost:3141
 'use strict';
@@ -280,7 +281,8 @@ function loadAll() {
   const dailyByAgent = {}; // { "2026-02-11": { agentId: cost } }
 
   for (const [id, info] of Object.entries(meta)) {
-    const sessFile = path.join(OC, 'agents', id, 'sessions', 'sessions.json');
+    const sessDir = path.join(OC, 'agents', id, 'sessions');
+    const sessFile = path.join(sessDir, 'sessions.json');
     const sessions = readJSON(sessFile) || {};
 
     const heartbeats = [];
@@ -291,13 +293,31 @@ function loadAll() {
     let contextTokens = 200000;
     let totalTokens   = 0;
 
+    // Read ALL .jsonl files in sessions directory (not just registered ones)
+    const allSessionFiles = [];
+    try {
+      const files = fs.readdirSync(sessDir);
+      for (const file of files) {
+        if (file.endsWith('.jsonl')) {
+          allSessionFiles.push(path.join(sessDir, file));
+        }
+      }
+    } catch (e) {
+      // Directory doesn't exist or can't be read
+    }
+
+    // Prefer registered sessions for metadata
     for (const sess of Object.values(sessions)) {
       if (!sess.sessionFile) continue;
       model         = sess.model         || model;
       contextTokens = sess.contextTokens || contextTokens;
       totalTokens   = Math.max(totalTokens, sess.totalTokens || 0);
       lastTime      = Math.max(lastTime, sess.updatedAt || 0);
-      const hbs = parseHeartbeats(readJSONL(sess.sessionFile));
+    }
+
+    // Parse all session files
+    for (const sessionFile of allSessionFiles) {
+      const hbs = parseHeartbeats(readJSONL(sessionFile));
       for (const hb of hbs) {
         totalCost   += hb.totalCost;
         totalErrors += hb.errorCount || 0;
