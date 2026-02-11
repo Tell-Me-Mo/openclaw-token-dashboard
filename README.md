@@ -2,7 +2,7 @@
 
 **Real-time token usage analytics and cost optimization for OpenClaw multi-agent systems**
 
-An extension for [OpenClaw](https://github.com/yourusername/openclaw) that provides comprehensive visibility into LLM token consumption, costs, and performance across all your agents.
+An extension for OpenClaw that provides comprehensive visibility into LLM token consumption, costs, and performance across all your agents.
 
 ![Dashboard Preview](https://img.shields.io/badge/OpenClaw-Extension-blue)
 
@@ -48,7 +48,7 @@ An extension for [OpenClaw](https://github.com/yourusername/openclaw) that provi
 
 1. **Clone this repository:**
    ```bash
-   git clone https://github.com/yourusername/openclaw-token-dashboard.git
+   git clone https://github.com/Tell-Me-Mo/openclaw-token-dashboard.git
    cd openclaw-token-dashboard
    ```
 
@@ -224,7 +224,7 @@ Potential future enhancements:
 
 ## Contributing
 
-Contributions welcome! Please open an issue or PR at https://github.com/yourusername/openclaw-token-dashboard
+Contributions welcome! Please open an issue or PR at https://github.com/Tell-Me-Mo/openclaw-token-dashboard
 
 ## License
 
