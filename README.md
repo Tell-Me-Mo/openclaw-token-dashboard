@@ -6,8 +6,6 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 
 ![Dashboard Preview](https://img.shields.io/badge/OpenClaw-Extension-blue)
 
-## Screenshots
-
 ### Main Dashboard View
 <img width="1911" height="524" alt="image" src="https://github.com/user-attachments/assets/48b6a3ce-ddf9-493c-ae3b-c0778629f225" />
 
