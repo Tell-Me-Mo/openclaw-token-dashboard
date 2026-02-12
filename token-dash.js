@@ -220,7 +220,7 @@ function finalizeRun(r) {
 
   // Error count
   r.errorCount = r.steps.reduce((sum, s) =>
-    sum + (s.toolResults?.filter(tr => tr.isError).length || 0), 0);
+    sum + (s.toolResults?.filter(tr => hasError(tr)).length || 0), 0);
 
   // Browser action breakdown
   const browserBreakdown = {};
@@ -271,6 +271,52 @@ function getBudget() {
   const budgetFile = path.join(OC, 'canvas', 'budget.json');
   const budget = readJSON(budgetFile) || { daily: 5.00, monthly: 100.00 };
   return budget;
+}
+
+function cleanStepForAPI(step) {
+  return {
+    time: step.time,
+    durationMs: step.durationMs,
+    text: step.text,
+    toolCalls: step.toolCalls,
+    toolResults: step.toolResults,
+    cost: step.cost,
+  };
+}
+
+function hasError(toolResult) {
+  // Check explicit error flag
+  if (toolResult.isError) return true;
+
+  // Check if result content indicates an error
+  const preview = toolResult.preview || '';
+  try {
+    // Try to parse JSON result
+    const parsed = JSON.parse(preview);
+    if (parsed.status === 'error' || parsed.error) return true;
+  } catch {
+    // Not JSON or parse error, check string content
+    if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
+  }
+
+  return false;
+}
+
+function cleanHeartbeatForAPI(hb, errorsOnly = false) {
+  let steps = hb.steps?.map(cleanStepForAPI) || [];
+
+  // Filter to only steps with errors if requested
+  if (errorsOnly) {
+    steps = steps.filter(step =>
+      step.toolResults?.some(r => hasError(r)) || false
+    );
+  }
+
+  return {
+    ...hb,
+    steps,
+    ...(errorsOnly && { filteredToErrors: true, totalSteps: hb.steps?.length || 0 }),
+  };
 }
 
 function loadAll() {
@@ -407,44 +453,249 @@ http.createServer((req, res) => {
     return;
   }
 
-  if (url === '/api/export') {
+  // GET /api/agents - List all agents with summary stats
+  if (url === '/api/agents') {
     try {
-      const format = params.get('format') || 'json';
-      const days = parseInt(params.get('days') || '7', 10);
       const data = loadAll();
-      const cutoff = Date.now() - (days * 86400000);
+      const agents = data.agents.map(a => ({
+        id: a.id,
+        name: a.name,
+        emoji: a.emoji,
+        model: a.model,
+        totalCost: a.totalCost,
+        totalErrors: a.totalErrors,
+        heartbeatCount: a.heartbeats?.length || 0,
+        lastRun: a.lastTime,
+        avgCacheHit: Math.round((a.avgCacheHit || 0) * 100),
+        contextUsed: a.totalTokens,
+        contextLimit: a.contextTokens,
+      }));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(agents, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
 
-      // Flatten all heartbeats
-      const rows = [];
+  // GET /api/agent/:id?errors_only=true - Get specific agent details
+  if (url.startsWith('/api/agent/')) {
+    try {
+      const agentId = url.split('/api/agent/')[1].split('?')[0];
+      const errorsOnly = params.get('errors_only') === 'true' || params.get('errorsOnly') === 'true';
+      const data = loadAll();
+      const agent = data.agents.find(a => a.id === agentId);
+      if (!agent) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Agent not found' }));
+        return;
+      }
+      // Clean up heartbeats in agent data
+      const cleanAgent = {
+        ...agent,
+        heartbeats: agent.heartbeats?.map(hb => cleanHeartbeatForAPI(hb, errorsOnly)) || [],
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(cleanAgent, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/heartbeats?agent=X&limit=N&errors=true - Query heartbeats
+  if (url === '/api/heartbeats') {
+    try {
+      const agentId = params.get('agent');
+      const limit = parseInt(params.get('limit') || '10', 10);
+      const errorsOnly = params.get('errors') === 'true';
+      const minCost = parseFloat(params.get('minCost') || '0');
+      const data = loadAll();
+
+      let heartbeats = [];
       for (const a of data.agents) {
+        if (agentId && a.id !== agentId) continue;
         for (const hb of a.heartbeats || []) {
-          if (hb.startTime && new Date(hb.startTime).getTime() >= cutoff) {
-            rows.push({
-              agent: a.name,
-              date: new Date(hb.startTime).toISOString().split('T')[0],
-              time: new Date(hb.startTime).toISOString(),
-              cost: hb.totalCost,
-              steps: hb.steps?.length || 0,
-              errors: hb.errorCount || 0,
-              cacheHitPct: Math.round((hb.cacheHitRate || 0) * 100),
-              context: hb.finalContext || 0,
-              durationMs: hb.durationMs || 0,
-            });
-          }
+          heartbeats.push({
+            agent: a.id,
+            agentName: a.name,
+            startTime: hb.startTime,
+            endTime: hb.endTime,
+            durationMs: hb.durationMs,
+            cost: hb.totalCost,
+            steps: hb.steps?.length || 0,
+            errors: hb.errorCount || 0,
+            cacheHitRate: Math.round((hb.cacheHitRate || 0) * 100),
+            context: hb.finalContext,
+            summary: hb.summary || hb.trigger || '',
+            wasteFlags: hb.wasteFlags || [],
+          });
         }
       }
 
-      if (format === 'csv') {
-        const header = 'agent,date,time,cost,steps,errors,cacheHitPct,context,durationMs\n';
-        const csv = header + rows.map(r =>
-          `${r.agent},${r.date},${r.time},${r.cost},${r.steps},${r.errors},${r.cacheHitPct},${r.context},${r.durationMs}`
-        ).join('\n');
-        res.writeHead(200, { 'Content-Type': 'text/csv', 'Content-Disposition': `attachment; filename="openclaw-tokens-${days}d.csv"` });
-        res.end(csv);
-      } else {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(rows, null, 2));
+      // Apply filters
+      if (errorsOnly) heartbeats = heartbeats.filter(h => h.errors > 0);
+      if (minCost > 0) heartbeats = heartbeats.filter(h => h.cost >= minCost);
+
+      // Sort by time (newest first) and limit
+      heartbeats.sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+      heartbeats = heartbeats.slice(0, limit);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(heartbeats, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/latest?agent=X&errors_only=true - Get latest heartbeat for agent
+  if (url === '/api/latest') {
+    try {
+      const agentId = params.get('agent');
+      const errorsOnly = params.get('errors_only') === 'true' || params.get('errorsOnly') === 'true';
+
+      if (!agentId) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'agent parameter required' }));
+        return;
       }
+      const data = loadAll();
+      const agent = data.agents.find(a => a.id === agentId);
+      if (!agent || !agent.heartbeats?.length) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'No heartbeats found for agent' }));
+        return;
+      }
+      const latest = cleanHeartbeatForAPI(agent.heartbeats[0], errorsOnly); // Already sorted newest first
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(latest, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/heartbeat?agent=X&index=N&errors_only=true - Get specific heartbeat by index (matches UI hash)
+  if (url === '/api/heartbeat') {
+    try {
+      const agentId = params.get('agent');
+      const index = parseInt(params.get('index') || params.get('hb') || '0', 10);
+      const errorsOnly = params.get('errors_only') === 'true' || params.get('errorsOnly') === 'true';
+
+      if (!agentId) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'agent parameter required' }));
+        return;
+      }
+
+      const data = loadAll();
+      const agent = data.agents.find(a => a.id === agentId);
+      if (!agent || !agent.heartbeats?.length) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'No heartbeats found for agent' }));
+        return;
+      }
+
+      if (index < 0 || index >= agent.heartbeats.length) {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: `Heartbeat index ${index} out of range (0-${agent.heartbeats.length - 1})` }));
+        return;
+      }
+
+      const heartbeat = cleanHeartbeatForAPI(agent.heartbeats[index], errorsOnly);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(heartbeat, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/budget - Get budget status
+  if (url === '/api/budget') {
+    try {
+      const data = loadAll();
+      const budget = data.budget || {};
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        daily: budget.daily || 0,
+        monthly: budget.monthly || 0,
+        todayCost: budget.todayCost || 0,
+        avg7Days: budget.avg7 || 0,
+        projectedMonthly: budget.projectedMonthly || 0,
+        dailyPct: budget.daily ? Math.round((budget.todayCost / budget.daily) * 100) : 0,
+        monthlyPct: budget.monthly ? Math.round((budget.projectedMonthly / budget.monthly) * 100) : 0,
+        status: budget.daily && budget.todayCost > budget.daily * 0.9 ? 'over' :
+                budget.daily && budget.todayCost > budget.daily * 0.7 ? 'warning' : 'ok',
+      }, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/daily?days=N - Get daily cost summary
+  if (url === '/api/daily') {
+    try {
+      const days = parseInt(params.get('days') || '7', 10);
+      const data = loadAll();
+      const today = new Date();
+      const dailySummary = [];
+
+      for (let i = 0; i < days; i++) {
+        const d = new Date(today);
+        d.setDate(d.getDate() - i);
+        const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+
+        let cost = 0, hbs = 0;
+        const byAgent = {};
+        for (const a of data.agents) {
+          for (const hb of a.heartbeats || []) {
+            if (hb.startTime && hb.startTime.startsWith(key)) {
+              cost += hb.totalCost;
+              hbs++;
+              byAgent[a.id] = (byAgent[a.id] || 0) + hb.totalCost;
+            }
+          }
+        }
+
+        dailySummary.push({ date: key, cost, heartbeats: hbs, byAgent });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(dailySummary, null, 2));
+    } catch (e) {
+      res.writeHead(500);
+      res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
+  // GET /api/stats - Overall statistics
+  if (url === '/api/stats') {
+    try {
+      const data = loadAll();
+      const totalCost = data.agents.reduce((s, a) => s + (a.totalCost || 0), 0);
+      const totalHbs = data.agents.reduce((s, a) => s + (a.heartbeats?.length || 0), 0);
+      const totalErrors = data.agents.reduce((s, a) => s + (a.totalErrors || 0), 0);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        totalAgents: data.agents.length,
+        totalCost,
+        totalHeartbeats: totalHbs,
+        totalErrors,
+        avgCostPerHeartbeat: totalHbs > 0 ? totalCost / totalHbs : 0,
+        budget: data.budget,
+        dailySummary: data.dailySummary,
+      }, null, 2));
     } catch (e) {
       res.writeHead(500);
       res.end(JSON.stringify({ error: e.message }));
@@ -477,7 +728,8 @@ const HTML = /* html */`<!DOCTYPE html>
 body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace,monospace;display:flex;height:100vh;overflow:hidden}
 
 /* ── Sidebar ── */
-#sidebar{width:210px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column}
+#sidebar{width:210px;border-right:1px solid var(--border);overflow-y:auto;flex-shrink:0;display:flex;flex-direction:column;transition:margin-left .3s,opacity .3s}
+#sidebar.collapsed{margin-left:-210px;opacity:0;pointer-events:none}
 #sidebar-head{padding:10px 12px;border-bottom:1px solid var(--border);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 .agent-row{padding:9px 12px;cursor:pointer;border-bottom:1px solid var(--border)44;transition:background .12s}
 .agent-row:hover{background:var(--surface2)}
@@ -497,14 +749,12 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 .pill{font-size:10px;padding:2px 7px;border-radius:10px;background:var(--surface2);border:1px solid var(--border);color:var(--muted);white-space:nowrap}
 .pill.model{color:var(--blue)}
 .pill.pct-low{color:var(--green)}.pill.pct-med{color:var(--orange)}.pill.pct-high{color:var(--red)}
-#ctx-wrap{flex:1;max-width:180px;min-width:60px}
-#ctx-label{font-size:9px;color:var(--muted);margin-bottom:2px}
-#ctx-track{height:3px;background:var(--border);border-radius:2px}
-#ctx-fill{height:3px;border-radius:2px;background:var(--purple);transition:width .3s}
 #daily-pill{margin-left:auto;font-size:10px;color:var(--green);background:var(--surface2);padding:3px 8px;border-radius:10px;border:1px solid var(--border);display:none}
 #daily-pill .amt{font-weight:600}
-.export-btn{font-size:10px;padding:3px 8px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);color:var(--blue);cursor:pointer;transition:background .12s;text-decoration:none;display:inline-block}
-.export-btn:hover{background:var(--surface3)}
+.sidebar-toggle-btn{font-size:16px;padding:4px 8px;border-radius:6px;background:var(--surface2);border:1px solid var(--border);color:var(--text);cursor:pointer;transition:all .15s;margin-right:10px;line-height:1}
+.sidebar-toggle-btn:hover{background:var(--surface3);border-color:var(--border)cc}
+.compare-mode-btn{font-size:10px;padding:4px 10px;border-radius:6px;background:var(--blue)11;border:1px solid var(--blue)44;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
+.compare-mode-btn:hover{background:var(--blue)22;border-color:var(--blue)66}
 #budget-wrap{flex:1;max-width:220px;min-width:120px;display:none}
 #budget-label{font-size:9px;color:var(--muted);margin-bottom:2px;display:flex;justify-content:space-between}
 #budget-track{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
@@ -543,6 +793,20 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 .chart-row{display:flex;gap:16px;margin-bottom:12px;flex-wrap:wrap}
 .chart-box{flex:1;min-width:160px}
 
+/* ── Heartbeat Stats Grid ── */
+.hb-stats-grid{display:grid;grid-template-columns:2fr 1.2fr 1fr;gap:14px;margin-bottom:14px}
+.stat-chart-card,.stat-breakdown-card{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:10px;min-height:120px;display:flex;flex-direction:column}
+.stat-chart-title{font-size:10px;color:var(--text);font-weight:600;margin-bottom:10px;display:flex;align-items:center;gap:4px;flex-shrink:0}
+.stat-chart-content{overflow-x:auto;flex:1;display:flex;align-items:center}
+.breakdown-table{display:flex;flex-direction:column;gap:4px}
+.breakdown-row{display:flex;justify-content:space-between;align-items:center;padding:4px 6px;border-radius:3px;font-size:10px}
+.breakdown-row:hover{background:var(--surface2)}
+.breakdown-label{color:var(--muted)}
+.breakdown-value{font-weight:600;font-variant-numeric:tabular-nums}
+.breakdown-total{border-top:1px solid var(--border);margin-top:4px;padding-top:8px}
+@media(max-width:1400px){.hb-stats-grid{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:900px){.hb-stats-grid{grid-template-columns:1fr;}}
+
 /* ── Heartbeat list ── */
 .hb{border:1px solid var(--border);border-radius:6px;margin-bottom:7px;overflow:hidden}
 .hb-head{padding:8px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;background:var(--surface);transition:background .12s;user-select:none}
@@ -558,8 +822,12 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 .cache-good{color:var(--green);background:var(--green)11;border:1px solid var(--green)33}
 .cache-ok{color:var(--blue);background:var(--blue)11;border:1px solid var(--blue)33}
 .cache-low{color:var(--orange);background:var(--orange)11;border:1px solid var(--orange)33}
-.hb-sum{font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hb-arrow{font-size:9px;color:var(--muted)}
+.hb-sum{font-size:10px;color:var(--muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:100px}
+.hb-arrow{font-size:9px;color:var(--muted);margin-left:6px}
+.hb-api-btns{display:flex;gap:4px;flex-shrink:0;margin-left:auto}
+.api-btn{font-size:9px;padding:2px 6px;border-radius:4px;background:var(--surface3);border:1px solid var(--border);color:var(--blue);cursor:pointer;transition:all .12s;white-space:nowrap;flex-shrink:0}
+.api-btn:hover{background:var(--blue)22;border-color:var(--blue)44}
+.api-btn.copied{background:var(--green)22;border-color:var(--green)44;color:var(--green)}
 
 /* ── Heartbeat body ── */
 .hb-body{display:none;padding:10px 12px 12px;background:var(--bg);border-top:1px solid var(--border)}
@@ -577,6 +845,11 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 /* ── Step table ── */
 .tbl{width:100%;border-collapse:collapse;font-size:11px}
 .tbl th{padding:3px 8px;text-align:left;color:var(--muted);font-weight:normal;border-bottom:1px solid var(--border);white-space:nowrap;font-size:10px}
+.tbl th.sortable{cursor:pointer;user-select:none;transition:background .15s}
+.tbl th.sortable:hover{background:var(--surface2);color:var(--text)}
+.sort-arrow{font-size:8px;margin-left:3px;opacity:.5}
+.sort-arrow.asc::after{content:'▲'}
+.sort-arrow.desc::after{content:'▼'}
 .tbl td{padding:3px 8px;border-bottom:1px solid var(--border)33;vertical-align:top}
 .tbl tr:last-child td{border-bottom:none}
 .tbl .r{text-align:right;font-variant-numeric:tabular-nums}
@@ -593,6 +866,9 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 /* ── Step detail panel ── */
 .step-detail td{padding:0 !important;border-bottom:1px solid var(--border) !important}
 .step-detail-inner{padding:8px 10px;background:var(--surface3);display:flex;gap:12px;flex-wrap:wrap}
+.thinking-section{width:100%;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:8px 10px;margin-bottom:8px}
+.thinking-label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;font-weight:600}
+.thinking-text{font-size:11px;color:var(--text);line-height:1.5;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto}
 .detail-call{flex:1;min-width:220px;background:var(--surface);border:1px solid var(--border);border-radius:4px;padding:6px 8px;font-size:10px}
 .detail-call-head{font-size:10px;font-weight:600;color:var(--blue);margin-bottom:4px;display:flex;justify-content:space-between}
 .detail-call-args{color:var(--muted);margin-bottom:6px;word-break:break-all;white-space:pre-wrap;max-height:80px;overflow-y:auto}
@@ -632,6 +908,7 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 ::-webkit-scrollbar{width:5px;height:5px}
 ::-webkit-scrollbar-track{background:var(--bg)}
 ::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+.thinking-cell:hover{background:var(--surface2)22}
 </style>
 </head>
 <body>
@@ -643,19 +920,15 @@ body{background:var(--bg);color:var(--text);font:12px/1.5 'SF Mono',ui-monospace
 
 <div id="main">
   <div id="topbar">
+    <button id="sidebar-toggle" class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
     <span id="agent-title">Token Dashboard</span>
     <span id="pill-model" class="pill model" style="display:none"></span>
     <span id="pill-ctx"   class="pill"       style="display:none"></span>
-    <div  id="ctx-wrap"                       style="display:none">
-      <div id="ctx-label"></div>
-      <div id="ctx-track"><div id="ctx-fill"></div></div>
-    </div>
     <div id="budget-wrap"                     style="display:none">
       <div id="budget-label"><span class="lbl"></span><span class="proj"></span></div>
       <div id="budget-track"><div id="budget-fill"></div></div>
     </div>
-    <a href="/api/export?format=csv&days=7" class="export-btn" download>↓ CSV</a>
-    <a href="/api/export?format=json&days=7" class="export-btn" download>↓ JSON</a>
+    <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
   <div id="content"><div class="empty">← select an agent</div></div>
@@ -689,31 +962,89 @@ const fSz = n => { if(!n) return '—'; if(n>=1000000) return (n/1000000).toFixe
 function svgBars(vals, h, color, tipFn) {
   if (!vals.length) return '<svg></svg>';
   const maxV = Math.max(...vals, 1e-9);
-  const barW = Math.max(6, Math.min(30, Math.floor(560/vals.length)-2));
-  const gap  = 2;
-  const W    = vals.length*(barW+gap);
+  const W = 600; // Fixed viewBox width
+  const barW = Math.max(6, Math.floor(W/vals.length) - 3);
+  const gap  = 3;
   const bars = vals.map((v,i) => {
-    const bh = Math.max(1, Math.round((v/maxV)*(h-14)));
+    const bh = Math.max(2, Math.round((v/maxV)*(h-16)));
     const x  = i*(barW+gap);
-    const y  = h-bh-14;
-    return \`<rect x="\${x}" y="\${y}" width="\${barW}" height="\${bh}" fill="\${color}" rx="1" opacity=".85"><title>\${tipFn?tipFn(v,i):v}</title></rect>\`;
+    const y  = h-bh-12;
+    return \`<rect x="\${x}" y="\${y}" width="\${barW}" height="\${bh}" fill="\${color}" rx="2" opacity=".9"><title>\${tipFn?tipFn(v,i):v}</title></rect>\`;
   }).join('');
-  return \`<svg width="\${W}" height="\${h}" style="display:block">\${bars}</svg>\`;
+  return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">\${bars}</svg>\`;
 }
 
 function svgLine(vals, h, color) {
   const n = vals.length;
   if (n < 2) return '<svg></svg>';
   const maxV = Math.max(...vals, 1);
-  const W    = Math.max(n*8, 80);
+  const W = 600; // Fixed viewBox width
+  const pad = 10; // Padding
   const pts  = vals.map((v,i) => {
-    const x = Math.round(i*(W-4)/(n-1))+2;
-    const y = Math.round((1-v/maxV)*(h-6))+3;
+    const x = pad + Math.round(i*(W-2*pad)/(n-1));
+    const y = pad + Math.round((1-v/maxV)*(h-2*pad));
     return x+','+y;
   }).join(' ');
-  return \`<svg width="\${W}" height="\${h}" style="display:block">
-    <polyline points="\${pts}" fill="none" stroke="\${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+  return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">
+    <polyline points="\${pts}" fill="none" stroke="\${color}" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
   </svg>\`;
+}
+
+function svgToolBreakdown(steps) {
+  const toolCounts = {};
+  for (const s of steps) {
+    for (const tc of (s.toolCalls || [])) {
+      toolCounts[tc.name] = (toolCounts[tc.name] || 0) + 1;
+    }
+  }
+  const entries = Object.entries(toolCounts).sort((a,b) => b[1] - a[1]).slice(0, 5);
+  if (!entries.length) return '<div class="m" style="padding:20px;text-align:center;font-size:10px">No tools used</div>';
+
+  const maxCount = Math.max(...entries.map(e => e[1]));
+  const colors = {browser:'#58a6ff',read:'#39d353',write:'#39d353',edit:'#39d353',bash:'#e3b341',grep:'#bc8cff',glob:'#bc8cff'};
+
+  return entries.map(([tool, count]) => {
+    const pct = Math.round((count / maxCount) * 100);
+    const color = colors[tool] || '#8b949e';
+    return \`<div style="margin-bottom:6px">
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">
+        <span style="color:var(--text)">\${tool}</span>
+        <span style="color:var(--muted)">\${count}×</span>
+      </div>
+      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+        <div style="width:\${pct}%;height:100%;background:\${color};transition:width .3s"></div>
+      </div>
+    </div>\`;
+  }).join('');
+}
+
+function svgDurationBreakdown(steps) {
+  // Find top 5 slowest steps
+  const stepDurations = steps.map((s, i) => ({
+    index: i + 1,
+    duration: s.durationMs || 0,
+    text: (s.text || '').slice(0, 30) || 'Step ' + (i + 1)
+  })).filter(s => s.duration > 0).sort((a, b) => b.duration - a.duration).slice(0, 5);
+
+  if (!stepDurations.length) {
+    return '<div class="m" style="padding:20px;text-align:center;font-size:10px">No duration data</div>';
+  }
+
+  const maxDuration = Math.max(...stepDurations.map(s => s.duration));
+
+  return stepDurations.map(step => {
+    const pct = Math.round((step.duration / maxDuration) * 100);
+    const label = step.text.length > 30 ? step.text.slice(0, 27) + '...' : step.text;
+    return \`<div style="margin-bottom:6px">
+      <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:2px">
+        <span style="color:var(--text)" title="\${esc(step.text)}">Step #\${step.index}</span>
+        <span style="color:var(--muted)">\${fD(step.duration)}</span>
+      </div>
+      <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
+        <div style="width:\${pct}%;height:100%;background:#e3b341;transition:width .3s"></div>
+      </div>
+    </div>\`;
+  }).join('');
 }
 
 function svgTrendChart(trendData, agents) {
@@ -884,6 +1215,13 @@ function renderSidebar() {
 // ── Cross-agent overview ──────────────────────────────────────────────────────
 function renderCrossAgentView() {
   if (!DATA) return;
+
+  // Hide compare button in cross-agent view
+  document.getElementById('compare-mode-btn').style.display = 'none';
+  document.getElementById('agent-title').textContent = 'Token Dashboard';
+  document.getElementById('pill-model').style.display = 'none';
+  document.getElementById('pill-ctx').style.display = 'none';
+
   const agents = DATA.agents || [];
   const daily  = DATA.dailySummary || [];
 
@@ -933,17 +1271,15 @@ function renderAgent(a) {
   mEl.textContent = fModel(a.model);
   mEl.style.display = a.model ? '' : 'none';
 
-  const pct    = a.contextTokens ? Math.round(a.totalTokens/a.contextTokens*100) : 0;
-  const pctCls = pct>80?'pct-high':pct>50?'pct-med':'pct-low';
-  const cEl = document.getElementById('pill-ctx');
-  cEl.textContent = fN(a.totalTokens)+' / '+fN(a.contextTokens)+' ctx';
-  cEl.className   = 'pill '+pctCls;
-  cEl.style.display = '';
+  // Hide context pill
+  document.getElementById('pill-ctx').style.display = 'none';
 
-  const wEl = document.getElementById('ctx-wrap');
-  wEl.style.display = '';
-  document.getElementById('ctx-label').textContent = pct+'% context used';
-  document.getElementById('ctx-fill').style.width  = Math.min(pct,100)+'%';
+  const pct = a.contextTokens ? Math.round(a.totalTokens/a.contextTokens*100) : 0;
+
+  // Show compare mode button
+  const compareBtnEl = document.getElementById('compare-mode-btn');
+  compareBtnEl.style.display = '';
+  compareBtnEl.textContent = compareMode ? 'Exit Compare' : 'Compare';
 
   const el = document.getElementById('content');
   if (!a.heartbeats?.length) {
@@ -962,26 +1298,26 @@ function renderAgent(a) {
       <div class="stat-box"><div class="stat-label">Session cost</div><div class="stat-val green">\${f$(a.totalCost)}</div></div>
       <div class="stat-box"><div class="stat-label">Heartbeats</div><div class="stat-val blue">\${hbs.length}</div></div>
       <div class="stat-box"><div class="stat-label">Avg cost / hb</div><div class="stat-val orange">\${f$(a.totalCost/hbs.length)}</div></div>
-      <div class="stat-box"><div class="stat-label">Context</div><div class="stat-val purple">\${pct}%</div></div>
       <div class="stat-box"><div class="stat-label">Cache hit rate</div><div class="stat-val \${cachePct>70?'green':cachePct>50?'blue':'orange'}">\${cachePct}%</div></div>
     </div>
-    <div class="compare-bar">
-      <span class="compare-label">Compare:</span>
-      <span class="compare-chip \${compareMode&&compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):'Select 1st'}</span>
-      <span class="m">vs</span>
-      <span class="compare-chip \${compareMode&&compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):'Select 2nd'}</span>
-      <button class="compare-btn" onclick="toggleCompareMode()">\${compareMode?'Exit':'Enter'} compare mode</button>
-      \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">Clear</button>\`:''}
-    </div>
+    \${compareMode?\`
+      <div class="compare-bar">
+        <span class="compare-label">Compare mode:</span>
+        <span class="compare-chip \${compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):'Select 1st'}</span>
+        <span class="m">vs</span>
+        <span class="compare-chip \${compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):'Select 2nd'}</span>
+        \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">Clear</button>\`:''}
+      </div>
+    \`:''}
     \${compareHbs.length===2?renderComparison(hbs[compareHbs[0]],hbs[compareHbs[1]]):''}
     <div class="chart-row">
       <div class="chart-box">
         <div class="section-title">Cost per heartbeat</div>
-        <div class="spark-wrap">\${svgBars(costs,52,'#3fb950',(v,i)=>'#'+(i+1)+' '+f$(v))}</div>
+        <div class="spark-wrap">\${svgBars(costs,80,'#3fb950',(v,i)=>'#'+(i+1)+' '+f$(v))}</div>
       </div>
       <div class="chart-box">
         <div class="section-title">Context growth over heartbeats</div>
-        <div class="spark-wrap">\${svgLine(ctxs,52,'#bc8cff')}</div>
+        <div class="spark-wrap">\${svgLine(ctxs,80,'#bc8cff')}</div>
       </div>
     </div>
     \${hbs.map((hb,i)=>heartbeatRow(hb,i,hbs.length)).join('')}
@@ -996,12 +1332,12 @@ function heartbeatRow(hb, i, total) {
     ? \`<span class="hb-browser">\${Object.entries(hb.browserBreakdown).map(([k,v])=>k+'×'+v).join(' ')}</span>\`
     : '';
 
-  const cachePct = Math.round((hb.cacheHitRate || 0) * 100);
-  const cacheCls = cachePct > 70 ? 'cache-good' : cachePct > 50 ? 'cache-ok' : 'cache-low';
-  const cacheBadge = cachePct > 0 ? \`<span class="hb-cache \${cacheCls}">Cache \${cachePct}%</span>\` : '';
-
   const compareSelected = compareHbs.includes(i);
   const hbCls = compareSelected ? 'style="background:var(--blue)11"' : '';
+
+  // API URLs
+  const apiUrl = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}\`;
+  const apiUrlErrors = \`http://127.0.0.1:3141/api/heartbeat?agent=\${selectedId}&hb=\${i}&errors_only=true\`;
 
   return \`<div class="hb" id="hb\${i}" \${hbCls}>
     <div class="hb-head \${isOpen?'open':''}" onclick="toggleHb(\${i})" \${hbCls}>
@@ -1011,10 +1347,13 @@ function heartbeatRow(hb, i, total) {
       <span class="hb-ctx">ctx \${fN(hb.finalContext)}</span>
       <span class="hb-dur">\${fD(hb.durationMs)}</span>
       <span class="hb-steps">\${hb.steps?.length||0} steps</span>
-      \${browserBadge}
-      \${cacheBadge}
       \${errBadge}
+      \${browserBadge}
       <span class="hb-sum">\${esc(hb.summary||hb.trigger||'')}</span>
+      <div class="hb-api-btns" onclick="event.stopPropagation()">
+        <button class="api-btn" onclick="copyApiUrl('\${apiUrl}', this)" title="Copy API URL (all steps)">📋 API</button>
+        <button class="api-btn" onclick="copyApiUrl('\${apiUrlErrors}', this)" title="Copy API URL (errors only)">⚠ API</button>
+      </div>
       <span class="hb-arrow">\${isOpen?'▲':'▼'}</span>
     </div>
     <div class="hb-body \${isOpen?'open':''}">\${isOpen?heartbeatBody(hb,i):''}</div>
@@ -1051,43 +1390,46 @@ function heartbeatBody(hb, hbIdx) {
 
   return \`
     \${wasteHtml}
-    <div class="chart-row" style="margin-bottom:10px">
-      <div class="chart-box">
-        <div class="section-title">Cost per step</div>
-        \${svgBars(costs,44,'#3fb950',(v,i)=>'step '+(i+1)+' '+f$(v))}
+    <div class="hb-stats-grid">
+      <div class="stat-chart-card">
+        <div class="stat-chart-title">💰 Cost per step</div>
+        <div class="stat-chart-content">
+          \${svgBars(costs,90,'#3fb950',(v,i)=>'step '+(i+1)+' '+f$(v))}
+        </div>
       </div>
-      <div class="chart-box">
-        <div class="section-title">Context growth</div>
-        \${svgLine(ctxs,44,'#bc8cff')}
+      <div class="stat-chart-card">
+        <div class="stat-chart-title">🔧 Tool usage</div>
+        <div class="stat-chart-content" style="display:block;overflow-y:auto;max-height:140px">
+          \${svgToolBreakdown(steps)}
+        </div>
       </div>
-      <div class="chart-box" style="min-width:160px">
-        <div class="section-title">Cost breakdown</div>
-        <table class="tbl" style="font-size:10px">
-          <tr><td class="m">Input</td><td class="r g">\${f$(totIn)}</td></tr>
-          <tr><td class="m">Output</td><td class="r g">\${f$(totOut)}</td></tr>
-          <tr><td class="m">Cache read</td><td class="r g">\${f$(totCR)}</td></tr>
-          <tr><td class="m">Cache write</td><td class="r g">\${f$(totCW)}</td></tr>
-          <tr><td class="m">Tool results</td><td class="r b">\${fSz(totRes)}</td></tr>
-          <tr style="border-top:1px solid var(--border)">
-            <td class="m" style="padding-top:4px"><b>Total</b></td>
-            <td class="r g" style="padding-top:4px"><b>\${f$(hb.totalCost)}</b></td>
-          </tr>
-        </table>
+      <div class="stat-breakdown-card">
+        <div class="stat-chart-title">📊 Cost breakdown</div>
+        <div class="breakdown-table">
+          <div class="breakdown-row"><span class="breakdown-label">Input</span><span class="breakdown-value g">\${f$(totIn)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">Output</span><span class="breakdown-value g">\${f$(totOut)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">Cache read</span><span class="breakdown-value g">\${f$(totCR)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">Cache write</span><span class="breakdown-value g">\${f$(totCW)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">Tool results</span><span class="breakdown-value b">\${fSz(totRes)}</span></div>
+          <div class="breakdown-row breakdown-total">
+            <span class="breakdown-label"><b>Total</b></span>
+            <span class="breakdown-value g"><b>\${f$(hb.totalCost)}</b></span>
+          </div>
+        </div>
       </div>
     </div>
-    \${toolFreqBar(steps)}
     <table class="tbl">
       <thead>
         <tr>
           <th>#</th>
           <th>Time</th>
-          <th>Dur</th>
-          <th>Action</th>
-          <th class="r">Result</th>
-          <th class="r">Out tok</th>
-          <th class="r">Cache R</th>
-          <th class="r">Ctx</th>
-          <th class="r">Cost</th>
+          <th class="sortable" onclick="sortSteps(\${hbIdx},'dur')">Dur <span class="sort-arrow" id="sort-dur-\${hbIdx}"></span></th>
+          <th class="sortable" onclick="sortSteps(\${hbIdx},'action')">Action <span class="sort-arrow" id="sort-action-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'result')">Result <span class="sort-arrow" id="sort-result-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'output')">Out tok <span class="sort-arrow" id="sort-output-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cacheRead')">Cache R <span class="sort-arrow" id="sort-cacheRead-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'ctx')">Ctx <span class="sort-arrow" id="sort-ctx-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cost')">Cost <span class="sort-arrow" id="sort-cost-\${hbIdx}"></span></th>
           <th>Thinking</th>
         </tr>
       </thead>
@@ -1105,7 +1447,21 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
   const expanded = isOpen ? 'expanded' : '';
 
   // Check if this step has errors
-  const hasError = s.toolResults?.some(tr => tr.isError) || false;
+  const hasStepError = (toolResults) => {
+    if (!toolResults) return false;
+    return toolResults.some(tr => {
+      if (tr.isError) return true;
+      const preview = tr.preview || '';
+      try {
+        const parsed = JSON.parse(preview);
+        if (parsed.status === 'error' || parsed.error) return true;
+      } catch {
+        if (preview.includes('"status": "error"') || preview.includes('"status":"error"')) return true;
+      }
+      return false;
+    });
+  };
+  const hasError = hasStepError(s.toolResults);
   const errorBadge = hasError ? '<span class="err-badge" style="margin-left:4px">ERROR</span>' : '';
 
   let actionCell = '—';
@@ -1118,11 +1474,15 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
     actionCell = descs.slice(0,3).join(' ') + (descs.length>3 ? \` <span class="m">+\${descs.length-3}</span>\` : '') + errorBadge;
   }
 
+  const thinkingText = esc(s.text || '');
+  const thinkingPreview = thinkingText.slice(0, 120);
+  const isTruncated = thinkingText.length > 120;
+
   const mainRow = \`<tr class="step-row \${heat} \${expanded}" onclick="toggleStep(\${hbIdx},\${si})">
     <td class="m">\${si+1}</td>
     <td class="m">\${fT(s.time)}</td>
     <td class="m">\${fD(s.durationMs)}</td>
-    <td>\${actionCell}</td>
+    <td style="max-width:200px">\${actionCell}</td>
     <td class="r b">\${fSz(s.resultTotalSize)}</td>
     <td class="r o">\${fN(s.output)}</td>
     <td class="r p">\${fN(s.cacheRead)}</td>
@@ -1130,7 +1490,10 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
     <td class="r g">
       <span class="cost-bar" style="width:\${Math.round((s.cost||0)/maxStep*36)}px"></span>\${f$(s.cost)}
     </td>
-    <td class="m" style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px">\${esc((s.text||'').slice(0,80))}</td>
+    <td class="m thinking-cell" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px\${isTruncated?';cursor:pointer;text-decoration:underline dotted':''}"
+        title="\${isTruncated?'Click row to see full text':''}">
+      \${thinkingPreview}\${isTruncated?' <span style="color:var(--blue);font-weight:600">↓</span>':''}
+    </td>
   </tr>\`;
 
   if (!isOpen) return mainRow;
@@ -1142,9 +1505,21 @@ function stepRows(s, si, hbIdx, maxStep, avgCost, open) {
 function stepDetail(s) {
   const calls = s.toolCalls || [];
   const results = s.toolResults || [];
+  const thinkingText = s.text || '';
+
+  // Thinking text section (if present)
+  const thinkingHtml = thinkingText ? \`
+    <div class="thinking-section">
+      <div class="thinking-label">💭 Thinking</div>
+      <div class="thinking-text">\${esc(thinkingText)}</div>
+    </div>
+  \` : '';
 
   if (!calls.length && !results.length) {
-    return \`<div class="step-detail-inner"><div class="m" style="font-size:10px;padding:4px">No tool calls — model reasoning step</div></div>\`;
+    return \`<div class="step-detail-inner">
+      \${thinkingHtml}
+      \${!thinkingText ? '<div class="m" style="font-size:10px;padding:4px">No tool calls — model reasoning step</div>' : ''}
+    </div>\`;
   }
 
   const resultByCallId = {};
@@ -1166,7 +1541,7 @@ function stepDetail(s) {
     cards.push(detailCard(null, r));
   }
 
-  return \`<div class="step-detail-inner">\${cards.join('')}</div>\`;
+  return \`<div class="step-detail-inner">\${thinkingHtml}\${cards.join('')}</div>\`;
 }
 
 function detailCard(tc, result) {
@@ -1248,6 +1623,11 @@ function renderComparison(hb1, hb2) {
   </div>\`;
 }
 
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  sidebar.classList.toggle('collapsed');
+}
+
 function toggleCompareMode() {
   compareMode = !compareMode;
   if (!compareMode) compareHbs = [];
@@ -1299,6 +1679,102 @@ function restoreFromHash() {
       }
     }
   }
+}
+
+// ── Copy API URL ──────────────────────────────────────────────────────────────
+function copyApiUrl(url, btn) {
+  navigator.clipboard.writeText(url).then(() => {
+    const orig = btn.textContent;
+    btn.textContent = '✓ Copied';
+    btn.classList.add('copied');
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.classList.remove('copied');
+    }, 2000);
+  }).catch(err => {
+    console.error('Copy failed:', err);
+    btn.textContent = '✗ Failed';
+    setTimeout(() => {
+      btn.textContent = orig;
+    }, 2000);
+  });
+}
+
+// ── Table Sorting ─────────────────────────────────────────────────────────────
+const sortState = {}; // {hbIdx: {column, direction}}
+
+function sortSteps(hbIdx, column) {
+  if (!DATA) return;
+  const agent = DATA.agents.find(a => a.id === selectedId);
+  if (!agent) return;
+  const hb = agent.heartbeats[hbIdx];
+  if (!hb) return;
+
+  const state = sortState[hbIdx] || {};
+  let newDir = null;
+
+  // 3-click cycle: asc -> desc -> clear
+  if (state.column === column) {
+    if (state.direction === 'asc') {
+      newDir = 'desc';
+    } else if (state.direction === 'desc') {
+      newDir = null; // Clear sorting
+    }
+  } else {
+    newDir = 'asc'; // First click on new column
+  }
+
+  // Clear all arrows
+  document.querySelectorAll(\`#steps-\${hbIdx}\`).forEach(el => {
+    el.parentElement.querySelectorAll('.sort-arrow').forEach(arr => arr.className = 'sort-arrow');
+  });
+
+  // If clearing, reset to original order
+  if (newDir === null) {
+    delete sortState[hbIdx];
+    const steps = hb.steps || [];
+    const costs = steps.map(s => s.cost || 0);
+    const avgCost = costs.reduce((a,b) => a+b, 0) / costs.length;
+    const maxStep = Math.max(...costs, 1e-9);
+    const open = expandedSteps[hbIdx] || new Set();
+    const tbody = document.getElementById(\`steps-\${hbIdx}\`);
+    if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, maxStep, avgCost, open)).join('');
+    return;
+  }
+
+  // Update sort state
+  sortState[hbIdx] = { column, direction: newDir };
+
+  // Set current arrow
+  const arrow = document.getElementById(\`sort-\${column}-\${hbIdx}\`);
+  if (arrow) arrow.className = \`sort-arrow \${newDir}\`;
+
+  // Sort steps
+  const steps = [...(hb.steps || [])];
+  const costs = steps.map(s => s.cost || 0);
+  const avgCost = costs.reduce((a,b) => a+b, 0) / costs.length;
+  const maxStep = Math.max(...costs, 1e-9);
+  const open = expandedSteps[hbIdx] || new Set();
+
+  steps.sort((a, b) => {
+    let valA, valB;
+    switch(column) {
+      case 'dur': valA = a.durationMs || 0; valB = b.durationMs || 0; break;
+      case 'action': valA = (a.toolCalls?.[0]?.name || ''); valB = (b.toolCalls?.[0]?.name || ''); break;
+      case 'result': valA = a.resultTotalSize || 0; valB = b.resultTotalSize || 0; break;
+      case 'output': valA = a.output || 0; valB = b.output || 0; break;
+      case 'cacheRead': valA = a.cacheRead || 0; valB = b.cacheRead || 0; break;
+      case 'ctx': valA = a.totalTokens || 0; valB = b.totalTokens || 0; break;
+      case 'cost': valA = a.cost || 0; valB = b.cost || 0; break;
+      default: return 0;
+    }
+    if (typeof valA === 'string') return newDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+    return newDir === 'asc' ? valA - valB : valB - valA;
+  });
+
+  // Re-render tbody
+  const tbody = document.getElementById(\`steps-\${hbIdx}\`);
+  if (tbody) tbody.innerHTML = steps.map((s, si) => stepRows(s, si, hbIdx, maxStep, avgCost, open)).join('');
 }
 
 // ── Interactions ──────────────────────────────────────────────────────────────
