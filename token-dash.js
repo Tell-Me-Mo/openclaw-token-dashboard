@@ -968,8 +968,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .back-btn:hover{background:var(--surface3);color:var(--text);border-color:var(--muted2)}
 .cleanup-btn{font-size:10px;padding:5px 12px;border-radius:var(--radius-sm);background:var(--red)0a;border:1px solid var(--red)22;color:var(--red);cursor:pointer;transition:all .15s}
 .cleanup-btn:hover{background:var(--red)18;border-color:var(--red)44}
-.cleanup-all-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--red)0a;border:1px solid var(--red)22;color:var(--red);cursor:pointer;transition:all .15s;font-weight:600}
-.cleanup-all-btn:hover{background:var(--red)18;border-color:var(--red)44}
 .compare-mode-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--glow-blue);border:1px solid var(--blue)33;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
 .compare-mode-btn:hover{background:var(--blue)1a;border-color:var(--blue)55}
 #budget-wrap{flex:1;max-width:240px;min-width:130px;display:none}
@@ -1230,7 +1228,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
       <div id="budget-track"><div id="budget-fill"></div></div>
     </div>
     <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
-    <button id="cleanup-all-btn" class="cleanup-all-btn" onclick="cleanupAll()" style="display:none">🗑 Cleanup All</button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
   <div id="content"><div class="empty">← select an agent</div></div>
@@ -1713,7 +1710,6 @@ function renderCrossAgentView() {
 
   // Hide compare button in cross-agent view
   document.getElementById('compare-mode-btn').style.display = 'none';
-  document.getElementById('cleanup-all-btn').style.display = '';
   document.getElementById('agent-title').textContent = 'OpenClaw Trace';
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
@@ -2038,7 +2034,6 @@ function filterActions(type) {
 // ── Agent view ────────────────────────────────────────────────────────────────
 function renderAgent(a) {
   document.getElementById('agent-title').textContent = a.emoji+' '+a.name;
-  document.getElementById('cleanup-all-btn').style.display = 'none';
 
   const mEl = document.getElementById('pill-model');
   mEl.textContent = fModel(a.model);
@@ -2676,20 +2671,6 @@ async function cleanupAgent(agentId) {
     const r = await fetch(\`/api/cleanup?agent=\${agentId}\`, { method: 'DELETE' });
     const data = await r.json();
     if (data.error) throw new Error(data.error);
-    fetchData();
-  } catch (e) {
-    alert('Cleanup failed: ' + e.message);
-  }
-}
-
-async function cleanupAll() {
-  const totalHbs = DATA?.agents?.reduce((s, a) => s + (a.heartbeats?.length || 0), 0) || 0;
-  if (!confirm(\`Delete ALL heartbeat sessions for ALL agents? (\${totalHbs} total heartbeats)\\n\\nThis cannot be undone.\`)) return;
-  try {
-    const r = await fetch('/api/cleanup', { method: 'DELETE' });
-    const data = await r.json();
-    if (data.error) throw new Error(data.error);
-    goHome();
     fetchData();
   } catch (e) {
     alert('Cleanup failed: ' + e.message);
