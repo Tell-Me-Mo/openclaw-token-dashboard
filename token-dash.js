@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// OpenClaw Token Dashboard
-// Repository: https://github.com/Tell-Me-Mo/openclaw-token-dashboard
+// OpenClaw Trace
+// Repository: https://github.com/Tell-Me-Mo/openclaw-trace
 // Usage: node ~/.openclaw/canvas/token-dash.js
 // Then open: http://localhost:3141
 'use strict';
@@ -979,7 +979,7 @@ http.createServer(async (req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
   res.end(HTML);
 }).listen(PORT, () => {
-  console.log(`\n  🦞 Token Dashboard → http://localhost:${PORT}\n`);
+  console.log(`\n  🦞 OpenClaw Trace → http://localhost:${PORT}\n`);
 });
 
 // ── Frontend ──────────────────────────────────────────────────────────────────
@@ -989,7 +989,7 @@ const HTML = /* html */`<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Token Dashboard</title>
+<title>OpenClaw Trace</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -1316,7 +1316,7 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
   <div id="topbar">
     <button id="sidebar-toggle" class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
     <button id="back-btn" class="back-btn" onclick="goHome()" style="display:none" title="Back to overview">←</button>
-    <span id="agent-title" style="cursor:pointer" onclick="if(selectedId)goHome()">Token Dashboard</span>
+    <span id="agent-title" style="cursor:pointer" onclick="if(selectedId)goHome()">OpenClaw Trace</span>
     <span id="pill-model" class="pill model" style="display:none"></span>
     <span id="pill-ctx"   class="pill"       style="display:none"></span>
     <div id="budget-wrap"                     style="display:none">
@@ -1820,7 +1820,7 @@ function renderCrossAgentView() {
   // Hide compare button in cross-agent view
   document.getElementById('compare-mode-btn').style.display = 'none';
   document.getElementById('cleanup-all-btn').style.display = '';
-  document.getElementById('agent-title').textContent = 'Token Dashboard';
+  document.getElementById('agent-title').textContent = 'OpenClaw Trace';
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
 
@@ -2754,7 +2754,7 @@ function goHome(skipPush) {
   if (!skipPush) history.pushState(null, '', window.location.pathname);
   renderSidebar();
   document.getElementById('back-btn').style.display = 'none';
-  document.getElementById('agent-title').textContent = 'Token Dashboard';
+  document.getElementById('agent-title').textContent = 'OpenClaw Trace';
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
   document.getElementById('compare-mode-btn').style.display = 'none';

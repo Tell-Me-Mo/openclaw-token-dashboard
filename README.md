@@ -1,8 +1,8 @@
-# OpenClaw Token Dashboard
+# OpenClaw Trace
 
-**Real-time token usage analytics and cost optimization for OpenClaw multi-agent systems**
+**End-to-end tracing and observability for OpenClaw multi-agent systems**
 
-An extension for OpenClaw that provides comprehensive visibility into LLM token consumption, costs, and performance across all your agents.
+An extension for OpenClaw that provides comprehensive visibility into agent execution traces, token consumption, costs, and performance across all your agents.
 
 ![Dashboard Preview](https://img.shields.io/badge/OpenClaw-Extension-blue)
 
@@ -38,8 +38,8 @@ An extension for OpenClaw that provides comprehensive visibility into LLM token 
 
 1. **Clone this repository:**
    ```bash
-   git clone https://github.com/Tell-Me-Mo/openclaw-token-dashboard.git
-   cd openclaw-token-dashboard
+   git clone https://github.com/Tell-Me-Mo/openclaw-trace.git
+   cd openclaw-trace
    ```
 
 2. **Copy the dashboard to your OpenClaw installation:**
@@ -71,7 +71,7 @@ node ~/.openclaw/canvas/token-dash.js
 
 Output:
 ```
-  🦞 Token Dashboard → http://localhost:3141
+  🦞 OpenClaw Trace → http://localhost:3141
 ```
 
 ### Access the Dashboard
@@ -224,7 +224,7 @@ Both can run simultaneously with no conflicts.
 
 ## Development
 
-The entire dashboard is a single `token-dash.js` file (~1350 lines):
+The entire application is a single `token-dash.js` file (~1350 lines):
 - **Backend**: Node.js HTTP server + JSONL parser
 - **Frontend**: Embedded HTML/CSS/JS (no build step)
 - **Rendering**: Vanilla JS with SVG charts
@@ -251,7 +251,7 @@ Potential future enhancements:
 
 ## Contributing
 
-Contributions welcome! Please open an issue or PR at https://github.com/Tell-Me-Mo/openclaw-token-dashboard
+Contributions welcome! Please open an issue or PR at https://github.com/Tell-Me-Mo/openclaw-trace
 
 ## License
 
@@ -259,7 +259,7 @@ MIT License - see LICENSE file for details
 
 ## Acknowledgments
 
-Built for the OpenClaw multi-agent framework. Token optimization insights based on community research from Reddit, Twitter, and HackerNews discussions about LLM cost management.
+Built for the OpenClaw multi-agent framework.
 
 ---
 

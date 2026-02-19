@@ -1,5 +1,5 @@
 #!/bin/bash
-# Token Dashboard Helper Functions
+# OpenClaw Trace Helper Functions
 # Source this file in your agent scripts: source ~/.openclaw/canvas/dashboard-helper.sh
 
 DASHBOARD_API="http://127.0.0.1:3141/api"
@@ -137,7 +137,7 @@ dashboard_agent_stats() {
 
 # Example usage guard
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-  echo "Token Dashboard Helper Functions"
+  echo "OpenClaw Trace Helper Functions"
   echo "Usage: source $0"
   echo ""
   echo "Available functions:"

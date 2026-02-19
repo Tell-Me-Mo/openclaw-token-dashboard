@@ -1,4 +1,4 @@
-# Token Dashboard API
+# OpenClaw Trace API
 
 Base URL: `http://127.0.0.1:3141`
 
