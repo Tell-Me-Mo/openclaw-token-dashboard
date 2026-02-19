@@ -7,12 +7,14 @@ An extension for OpenClaw that provides comprehensive visibility into agent exec
 ![Dashboard Preview](https://img.shields.io/badge/OpenClaw-Extension-blue)
 
 ### Main Dashboard View
-<img width="1911" height="524" alt="image" src="https://github.com/user-attachments/assets/48b6a3ce-ddf9-493c-ae3b-c0778629f225" />
+<img width="1541" height="921" alt="image" src="https://github.com/user-attachments/assets/3ccb1a4c-66a4-4ac3-af5a-651a3561f5ec" />
+
 
 *Overview of agent performance with cost and context growth charts. Shows sidebar with all agents, stats cards, and expandable heartbeat rows.*
 
 ### Detailed Heartbeat Analysis
-<img width="1884" height="716" alt="image" src="https://github.com/user-attachments/assets/d1e6ec2c-8956-4f49-86da-711fce27075f" />
+<img width="1531" height="664" alt="image" src="https://github.com/user-attachments/assets/f0ee25ec-27d5-428f-b698-b9d1efd79104" />
+
 
 *Expanded heartbeat view showing cost per step, tool usage breakdown, cost breakdown, and detailed step-by-step execution with full tool call/result inspection.*
 
