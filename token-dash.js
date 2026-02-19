@@ -867,72 +867,6 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // GET /api/mem-stats - Claude-mem statistics (proxy to worker)
-  if (url === '/api/mem-stats') {
-    try {
-      const workerRes = await fetch('http://127.0.0.1:37777/api/stats').catch(() => null);
-      if (!workerRes || !workerRes.ok) {
-        res.writeHead(503);
-        res.end(JSON.stringify({ error: 'Claude-mem worker not available' }));
-        return;
-      }
-      const stats = await workerRes.json();
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(stats));
-    } catch (e) {
-      res.writeHead(500);
-      res.end(JSON.stringify({ error: e.message }));
-    }
-    return;
-  }
-
-  // GET /api/mem-sessions - Session breakdown from claude-mem DB
-  if (url === '/api/mem-sessions') {
-    try {
-      const { execSync } = require('child_process');
-      const dbPath = path.join(os.homedir(), '.claude-mem', 'claude-mem.db');
-
-      // Get totals
-      const totalsQuery = 'SELECT SUM(discovery_tokens) as total_work, COUNT(*) as total_obs FROM observations WHERE discovery_tokens > 0';
-      const totalsResult = execSync('sqlite3 "' + dbPath + '" "' + totalsQuery + '"', { encoding: 'utf8' }).trim();
-      const [totalWork, totalObs] = totalsResult.split('|').map(v => parseInt(v) || 0);
-
-      // Get session breakdown with project and prompt info using JSON output
-      const query = "SELECT json_object(" +
-        "'memory_session_id', o.memory_session_id, " +
-        "'project', COALESCE(s.project, 'Unknown'), " +
-        "'user_prompt', COALESCE(s.user_prompt, ''), " +
-        "'observation_count', COUNT(*), " +
-        "'work_tokens', SUM(o.discovery_tokens), " +
-        "'created_at', MIN(o.created_at)" +
-        ") FROM observations o LEFT JOIN sdk_sessions s ON o.memory_session_id = s.memory_session_id WHERE o.discovery_tokens > 0 GROUP BY o.memory_session_id ORDER BY MIN(o.created_at_epoch) DESC LIMIT 20";
-
-      const result = execSync('sqlite3 "' + dbPath + '" "' + query + '" 2>/dev/null', {
-        encoding: 'utf8'
-      }).trim();
-
-      const sessions = result.split('\n').filter(Boolean).map(line => {
-        try {
-          return JSON.parse(line);
-        } catch (e) {
-          return null;
-        }
-      }).filter(Boolean);
-
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        sessions,
-        totals: {
-          work_tokens: totalWork,
-          observations: totalObs
-        }
-      }));
-    } catch (e) {
-      res.writeHead(500);
-      res.end(JSON.stringify({ error: e.message, sessions: [], totals: {} }));
-    }
-    return;
-  }
 
   // DELETE /api/cleanup?agent=X - Delete all heartbeat session files for an agent
   // DELETE /api/cleanup - Delete all heartbeat session files for ALL agents
@@ -1038,8 +972,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 .cleanup-all-btn:hover{background:var(--red)18;border-color:var(--red)44}
 .compare-mode-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--glow-blue);border:1px solid var(--blue)33;color:var(--blue);cursor:pointer;transition:all .15s;font-weight:600}
 .compare-mode-btn:hover{background:var(--blue)1a;border-color:var(--blue)55}
-.memory-stats-btn{font-size:10px;padding:5px 14px;border-radius:var(--radius-sm);background:var(--purple)0a;border:1px solid var(--purple)33;color:var(--purple);cursor:pointer;transition:all .15s;font-weight:600;margin-left:4px}
-.memory-stats-btn:hover{background:var(--purple)1a;border-color:var(--purple)55}
 #budget-wrap{flex:1;max-width:240px;min-width:130px;display:none}
 #budget-label{font-size:10px;color:var(--muted);margin-bottom:3px;display:flex;justify-content:space-between}
 #budget-track{height:6px;background:var(--border);border-radius:3px;overflow:hidden}
@@ -1277,32 +1209,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 ::-webkit-scrollbar-thumb:hover{background:var(--border-light)}
 .thinking-cell:hover{background:var(--surface2)22}
 
-/* ── Memory Stats Modal ── */
-#memory-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:1000;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
-#memory-modal.show{display:flex}
-.modal-content{background:var(--surface);border:1px solid var(--border);border-radius:12px;width:90%;max-width:900px;max-height:85vh;overflow-y:auto;box-shadow:0 12px 48px rgba(0,0,0,.6)}
-.modal-header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;background:var(--surface);z-index:10}
-.modal-title{font-size:15px;font-weight:700;color:var(--purple);display:flex;align-items:center;gap:8px}
-.modal-close{font-size:20px;color:var(--muted);cursor:pointer;background:none;border:none;padding:0;width:28px;height:28px;display:flex;align-items:center;justify-content:center;border-radius:var(--radius-sm);transition:all .15s}
-.modal-close:hover{background:var(--surface2);color:var(--text)}
-.modal-body{padding:18px 20px}
-.mem-stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:24px}
-.mem-stat-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:14px}
-.mem-stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;font-weight:500}
-.mem-stat-value{font-size:20px;font-weight:700;color:var(--text);font-family:var(--font-mono)}
-.mem-stat-sub{font-size:10px;color:var(--muted);margin-top:3px}
-.mem-stat-value.purple{color:var(--purple)}
-.mem-stat-value.green{color:var(--green)}
-.mem-stat-value.blue{color:var(--blue)}
-.mem-stat-value.orange{color:var(--orange)}
-.mem-section-title{font-size:11px;font-weight:600;color:var(--text);margin:20px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--border)}
-.mem-session-table{width:100%;font-size:10px;border-collapse:collapse;margin-bottom:16px}
-.mem-session-table th{text-align:left;padding:8px 10px;color:var(--muted);font-weight:600;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.05em;font-size:9px}
-.mem-session-table td{padding:6px 10px;border-bottom:1px solid var(--border)33}
-.mem-session-table tr:hover{background:var(--surface3)}
-.mem-session-table .r{text-align:right;font-variant-numeric:tabular-nums}
-.mem-loading{text-align:center;padding:40px;color:var(--muted)}
-.mem-error{text-align:center;padding:40px;color:var(--red)}
 </style>
 </head>
 <body>
@@ -1324,7 +1230,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
       <div id="budget-track"><div id="budget-fill"></div></div>
     </div>
     <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
-    <button id="memory-stats-btn" class="memory-stats-btn" onclick="showMemoryStats()">🧠 Memory Stats</button>
     <button id="cleanup-all-btn" class="cleanup-all-btn" onclick="cleanupAll()" style="display:none">🗑 Cleanup All</button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
@@ -1333,17 +1238,6 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 
 <div id="refresh">● auto-refresh 5s</div>
 
-<div id="memory-modal">
-  <div class="modal-content">
-    <div class="modal-header">
-      <div class="modal-title">🧠 Claude-Mem Memory Statistics</div>
-      <button class="modal-close" onclick="hideMemoryStats()">×</button>
-    </div>
-    <div class="modal-body" id="memory-modal-body">
-      <div class="mem-loading">Loading memory statistics...</div>
-    </div>
-  </div>
-</div>
 
 <script>
 let DATA = null;
@@ -2551,189 +2445,6 @@ function clearCompare() {
   if (a) renderAgent(a);
 }
 
-// ── Memory Stats Modal ────────────────────────────────────────────────────────
-async function showMemoryStats() {
-  const modal = document.getElementById('memory-modal');
-  const body = document.getElementById('memory-modal-body');
-  modal.classList.add('show');
-  body.innerHTML = '<div class="mem-loading">Loading memory statistics...</div>';
-
-  try {
-    // Fetch overall stats from claude-mem worker
-    const statsRes = await fetch('/api/mem-stats');
-    if (!statsRes.ok) throw new Error('Failed to fetch memory stats');
-    const stats = await statsRes.json();
-
-    // Fetch session breakdown
-    const sessionsRes = await fetch('/api/mem-sessions');
-    if (!sessionsRes.ok) throw new Error('Failed to fetch session data');
-    const sessions = await sessionsRes.json();
-
-    renderMemoryStats(stats, sessions);
-  } catch (err) {
-    console.error('Memory stats error:', err);
-    const errMsg = err.message.slice(0, 200);
-    body.innerHTML = \`<div class="mem-error">Error loading stats: \${errMsg}</div>\`;
-  }
-}
-
-function hideMemoryStats() {
-  document.getElementById('memory-modal').classList.remove('show');
-}
-
-function renderMemoryStats(stats, sessions) {
-  const db = stats.database || {};
-  const worker = stats.worker || {};
-  const totals = sessions.totals || {};
-
-  // Calculate token savings using actual data
-  const workTokens = totals.work_tokens || 0;
-  const readTokens = Math.round(workTokens * 0.38); // 62% savings based on compression
-  const savedTokens = workTokens - readTokens;
-  const savingsPct = workTokens > 0 ? ((savedTokens / workTokens) * 100).toFixed(1) : 0;
-
-  const html = \`
-    <div class="mem-stat-grid">
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Total Observations</div>
-        <div class="mem-stat-value purple">\${fN(db.observations || 0)}</div>
-        <div class="mem-stat-sub">Recorded events</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Work Tokens</div>
-        <div class="mem-stat-value orange">\${fN(workTokens)}</div>
-        <div class="mem-stat-sub">Tokens spent creating</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Read Tokens</div>
-        <div class="mem-stat-value blue">\${fN(readTokens)}</div>
-        <div class="mem-stat-sub">Tokens to consume now</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Tokens Saved</div>
-        <div class="mem-stat-value green">\${fN(savedTokens)}</div>
-        <div class="mem-stat-sub">\${savingsPct}% compression</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Sessions Tracked</div>
-        <div class="mem-stat-value purple">\${fN(db.sessions || 0)}</div>
-        <div class="mem-stat-sub">Unique sessions</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Summaries</div>
-        <div class="mem-stat-value blue">\${fN(db.summaries || 0)}</div>
-        <div class="mem-stat-sub">Session summaries</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Database Size</div>
-        <div class="mem-stat-value orange">\${fmtSize(db.size || 0)}B</div>
-        <div class="mem-stat-sub">\${(db.path || '').split('/').pop()}</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Worker Uptime</div>
-        <div class="mem-stat-value green">\${formatUptime(worker.uptime || 0)}</div>
-        <div class="mem-stat-sub">\${worker.activeSessions || 0} active sessions</div>
-      </div>
-    </div>
-
-    <div class="mem-section-title">💾 Token Savings Breakdown</div>
-    <div class="mem-stat-grid">
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Cost Savings</div>
-        <div class="mem-stat-value green">\${f$(savedTokens * 0.000003)}</div>
-        <div class="mem-stat-sub">At Sonnet rates ($3/1M tokens)</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Compression Ratio</div>
-        <div class="mem-stat-value purple">\${savingsPct}%</div>
-        <div class="mem-stat-sub">Memory efficiency</div>
-      </div>
-      <div class="mem-stat-card">
-        <div class="mem-stat-label">Avg per Observation</div>
-        <div class="mem-stat-value blue">\${fN(Math.round(savedTokens / (db.observations || 1)))}</div>
-        <div class="mem-stat-sub">Tokens saved each</div>
-      </div>
-    </div>
-
-    \${sessions.sessions ? renderSessionBreakdown(sessions.sessions) : ''}
-  \`;
-
-  document.getElementById('memory-modal-body').innerHTML = html;
-}
-
-function renderSessionBreakdown(sessions) {
-  if (!sessions || sessions.length === 0) return '';
-
-  const rows = sessions.map(s => {
-    const workTokens = s.work_tokens || 0;
-    const readTokens = Math.round(workTokens * 0.38);
-    const saved = workTokens - readTokens;
-    const project = s.project || 'Unknown';
-    const sessionId = (s.memory_session_id || 'Unknown').slice(0, 40);
-
-    // Format datetime to show date + time
-    let dateTime = '—';
-    if (s.created_at) {
-      const dt = new Date(s.created_at);
-      const date = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-      const time = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
-      dateTime = date + ' ' + time;
-    }
-
-    // Truncate user prompt if available
-    const prompt = s.user_prompt ? (s.user_prompt.slice(0, 40) + (s.user_prompt.length > 40 ? '...' : '')) : '';
-    // Escape HTML and truncate for title attribute
-    const titleText = (s.user_prompt || sessionId).slice(0, 200).replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-
-    return \`
-      <tr title="\${titleText}">
-        <td style="font-size:9px;color:var(--blue);font-weight:500">\${esc(project)}</td>
-        <td style="font-size:9px;color:var(--muted)" title="\${esc(sessionId)}">\${esc(prompt || sessionId.slice(0, 30))}</td>
-        <td class="r">\${fN(s.observation_count || 0)}</td>
-        <td class="r">\${fN(workTokens)}</td>
-        <td class="r">\${fN(readTokens)}</td>
-        <td class="r" style="color:var(--green)">\${fN(saved)}</td>
-        <td class="r" style="font-size:9px;color:var(--muted)">\${dateTime}</td>
-      </tr>
-    \`;
-  }).join('');
-
-  return \`
-    <div class="mem-section-title">📊 Session Breakdown (Latest 20 sessions)</div>
-    <table class="mem-session-table">
-      <thead>
-        <tr>
-          <th>Project</th>
-          <th>Session / Prompt</th>
-          <th class="r">Obs</th>
-          <th class="r">Work</th>
-          <th class="r">Read</th>
-          <th class="r">Saved</th>
-          <th class="r">Created</th>
-        </tr>
-      </thead>
-      <tbody>\${rows}</tbody>
-    </table>
-  \`;
-}
-
-function formatUptime(ms) {
-  const sec = Math.floor(ms / 1000);
-  const min = Math.floor(sec / 60);
-  const hrs = Math.floor(min / 60);
-  const days = Math.floor(hrs / 24);
-
-  if (days > 0) return \`\${days}d \${hrs % 24}h\`;
-  if (hrs > 0) return \`\${hrs}h \${min % 60}m\`;
-  if (min > 0) return \`\${min}m\`;
-  return \`\${sec}s\`;
-}
-
-// Close modal on outside click
-document.addEventListener('click', (e) => {
-  const modal = document.getElementById('memory-modal');
-  if (e.target === modal) hideMemoryStats();
-});
 
 // ── URL hash navigation ───────────────────────────────────────────────────────
 function updateHash() {
