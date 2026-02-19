@@ -34,39 +34,19 @@ An extension for OpenClaw that provides comprehensive visibility into agent exec
 - **OpenClaw** installed and configured at `~/.openclaw`
 - **Node.js** v14+ (already required by OpenClaw)
 
-### Setup
-
-1. **Clone this repository:**
-   ```bash
-   git clone https://github.com/Tell-Me-Mo/openclaw-trace.git
-   cd openclaw-trace
-   ```
-
-2. **Copy the dashboard to your OpenClaw installation:**
-   ```bash
-   mkdir -p ~/.openclaw/canvas
-   cp token-dash.js ~/.openclaw/canvas/
-   cp budget.json ~/.openclaw/canvas/        # Optional: default budget config
-   cp dashboard-helper.sh ~/.openclaw/canvas/ # Optional: bash helper functions
-   cp API.md ~/.openclaw/canvas/              # Optional: API documentation
-   ```
-
-3. **Create budget configuration (optional):**
-   ```bash
-   cat > ~/.openclaw/canvas/budget.json <<EOF
-   {
-     "daily": 5.00,
-     "monthly": 100.00
-   }
-   EOF
-   ```
-
-## Usage
-
-### Start the Dashboard
+### Quick Start (recommended)
 
 ```bash
-node ~/.openclaw/canvas/token-dash.js
+npx openclaw-trace
+```
+
+No installation needed — runs directly from npm.
+
+### Global Install
+
+```bash
+npm install -g openclaw-trace
+openclaw-trace
 ```
 
 Output:

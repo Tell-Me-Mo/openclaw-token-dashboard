@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // OpenClaw Trace
 // Repository: https://github.com/Tell-Me-Mo/openclaw-trace
-// Usage: node ~/.openclaw/canvas/token-dash.js
+// Usage: npx openclaw-trace
 // Then open: http://localhost:3141
 'use strict';
 
