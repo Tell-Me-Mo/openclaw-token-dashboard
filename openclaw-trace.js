@@ -189,6 +189,7 @@ function parseHeartbeats(entries) {
         trigger:      extractText(msg),
         steps:        [],
         totalCost:    0,
+        totalTokensSum: 0,
         totalOutput:  0,
         finalContext: 0,
         summary:      '',
@@ -223,6 +224,7 @@ function parseHeartbeats(entries) {
           durationMs:       null,
         });
         cur.totalCost    += cost;
+        cur.totalTokensSum += u.totalTokens || 0;
         cur.totalOutput  += u.output || 0;
         cur.finalContext  = Math.max(cur.finalContext, u.totalTokens || 0);
         cur.endTime       = ts;
@@ -288,6 +290,9 @@ function finalizeRun(r) {
     totalInput += input;
   }
   r.cacheHitRate = (totalCacheRead + totalInput) > 0 ? totalCacheRead / (totalCacheRead + totalInput) : 0;
+  r.totalCacheRead = totalCacheRead;
+  r.totalInput = totalInput;
+  r.totalCacheWrite = r.steps.reduce((s,x) => s + (x.cacheWrite||0), 0);
 
   // Waste detection flags
   const wasteFlags = [];
@@ -513,6 +518,7 @@ function loadAll() {
   const meta   = getAgentMeta();
   const agents = [];
   const dailyCosts = {}; // { "2026-02-11": cost }
+  const dailyTokens = {}; // { "2026-02-11": tokens }
   const dailyHbs   = {}; // { "2026-02-11": count }
   const dailyByAgent = {}; // { "2026-02-11": { agentId: cost } }
 
@@ -523,7 +529,10 @@ function loadAll() {
 
     const heartbeats = [];
     let totalCost     = 0;
+    let totalTokensSum = 0;
     let totalErrors   = 0;
+    let totalCacheReadTk = 0;
+    let totalInputTk  = 0;
     let lastTime      = 0;
     let model         = '';
     let contextTokens = 200000;
@@ -556,7 +565,10 @@ function loadAll() {
       const hbs = parseHeartbeats(readJSONL(sessionFile));
       for (const hb of hbs) {
         totalCost   += hb.totalCost;
+        totalTokensSum += hb.totalTokensSum || 0;
         totalErrors += hb.errorCount || 0;
+        totalCacheReadTk += hb.totalCacheRead || 0;
+        totalInputTk += hb.totalInput || 0;
         heartbeats.push(hb);
 
         // Daily rollup
@@ -564,6 +576,7 @@ function loadAll() {
           const d = new Date(hb.startTime);
           const dateKey = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
           dailyCosts[dateKey] = (dailyCosts[dateKey] || 0) + hb.totalCost;
+          dailyTokens[dateKey] = (dailyTokens[dateKey] || 0) + (hb.totalTokensSum || 0);
           dailyHbs[dateKey]   = (dailyHbs[dateKey] || 0) + 1;
           if (!dailyByAgent[dateKey]) dailyByAgent[dateKey] = {};
           dailyByAgent[dateKey][id] = (dailyByAgent[dateKey][id] || 0) + hb.totalCost;
@@ -578,7 +591,7 @@ function loadAll() {
       ? heartbeats.reduce((sum, hb) => sum + (hb.cacheHitRate || 0), 0) / heartbeats.length
       : 0;
 
-    agents.push({ ...info, model, contextTokens, totalTokens, totalCost, totalErrors, lastTime, heartbeats, avgCacheHit });
+    agents.push({ ...info, model, contextTokens, totalTokens, totalCost, totalTokensSum, totalErrors, lastTime, heartbeats, avgCacheHit, totalCacheReadTk, totalInputTk });
   }
 
   agents.sort((a, b) => (b.lastTime || 0) - (a.lastTime || 0));
@@ -593,7 +606,8 @@ function loadAll() {
     const cost = dailyCosts[key] || 0;
     const hbs  = dailyHbs[key] || 0;
     const label = i === 0 ? 'Today' : i === 1 ? 'Yesterday' : d.toLocaleDateString('en', {weekday:'short'});
-    if (cost > 0 || i < 2) dailySummary.push({ label, cost, hbs, date: key });
+    const tokens = dailyTokens[key] || 0;
+    if (cost > 0 || i < 2) dailySummary.push({ label, cost, tokens, hbs, date: key, dayOffset: i });
   }
 
   // Budget projections
@@ -619,7 +633,7 @@ function loadAll() {
     d.setDate(d.getDate() - i);
     const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
     const label = i === 0 ? 'Today' : i === 1 ? 'Yest' : d.toLocaleDateString('en', {weekday:'short'}).slice(0,3);
-    trendData.push({ date: key, label, total: dailyCosts[key] || 0, byAgent: dailyByAgent[key] || {} });
+    trendData.push({ date: key, label, dayOffset: i, total: dailyCosts[key] || 0, tokens: dailyTokens[key] || 0, byAgent: dailyByAgent[key] || {} });
   }
 
   // Gateway-level errors (API errors, browser timeouts from log)
@@ -656,6 +670,7 @@ http.createServer(async (req, res) => {
         emoji: a.emoji,
         model: a.model,
         totalCost: a.totalCost,
+        totalTokens: a.totalTokensSum || 0,
         totalErrors: a.totalErrors,
         heartbeatCount: a.heartbeats?.length || 0,
         lastRun: a.lastTime,
@@ -718,6 +733,7 @@ http.createServer(async (req, res) => {
             endTime: hb.endTime,
             durationMs: hb.durationMs,
             cost: hb.totalCost,
+            tokens: hb.totalTokensSum || 0,
             steps: hb.steps?.length || 0,
             errors: hb.errorCount || 0,
             cacheHitRate: Math.round((hb.cacheHitRate || 0) * 100),
@@ -847,19 +863,20 @@ http.createServer(async (req, res) => {
         d.setDate(d.getDate() - i);
         const key = d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 
-        let cost = 0, hbs = 0;
+        let cost = 0, tokens = 0, hbs = 0;
         const byAgent = {};
         for (const a of data.agents) {
           for (const hb of a.heartbeats || []) {
             if (hb.startTime && hb.startTime.startsWith(key)) {
               cost += hb.totalCost;
+              tokens += hb.totalTokensSum || 0;
               hbs++;
               byAgent[a.id] = (byAgent[a.id] || 0) + hb.totalCost;
             }
           }
         }
 
-        dailySummary.push({ date: key, cost, heartbeats: hbs, byAgent });
+        dailySummary.push({ date: key, cost, tokens, heartbeats: hbs, byAgent });
       }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -876,6 +893,7 @@ http.createServer(async (req, res) => {
     try {
       const data = loadAll();
       const totalCost = data.agents.reduce((s, a) => s + (a.totalCost || 0), 0);
+      const totalTk = data.agents.reduce((s, a) => s + (a.totalTokensSum || 0), 0);
       const totalHbs = data.agents.reduce((s, a) => s + (a.heartbeats?.length || 0), 0);
       const totalErrors = data.agents.reduce((s, a) => s + (a.totalErrors || 0), 0);
 
@@ -883,9 +901,11 @@ http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         totalAgents: data.agents.length,
         totalCost,
+        totalTokens: totalTk,
         totalHeartbeats: totalHbs,
         totalErrors,
         avgCostPerHeartbeat: totalHbs > 0 ? totalCost / totalHbs : 0,
+        avgTokensPerHeartbeat: totalHbs > 0 ? Math.round(totalTk / totalHbs) : 0,
         budget: data.budget,
         dailySummary: data.dailySummary,
       }, null, 2));
@@ -964,13 +984,20 @@ const HTML = /* html */`<!DOCTYPE html>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
   --bg:#0b0e14;--surface:#12161f;--surface2:#1a1f2e;--surface3:#242a3a;
-  --border:#1e2535;--border-light:#2a3245;--text:#e2e8f0;--muted:#64748b;--muted2:#475569;
+  --border:#1e2535;--border-light:#2a3245;--text:#e2e8f0;--muted:#64748b;--muted2:#475569;--chart-label:#94a3b8;
   --blue:#60a5fa;--green:#4ade80;--orange:#fbbf24;
   --red:#f87171;--purple:#a78bfa;--accent:#3b82f6;--teal:#2dd4bf;
   --glow-blue:rgba(96,165,250,.08);--glow-green:rgba(74,222,128,.08);
   --radius:10px;--radius-sm:6px;
   --font-sans:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;
   --font-mono:'SF Mono','Fira Code',ui-monospace,monospace;
+}
+html.light{
+  --bg:#f8fafc;--surface:#ffffff;--surface2:#f1f5f9;--surface3:#e2e8f0;
+  --border:#e2e8f0;--border-light:#cbd5e1;--text:#1e293b;--muted:#64748b;--muted2:#94a3b8;--chart-label:#475569;
+  --blue:#2563eb;--green:#16a34a;--orange:#d97706;
+  --red:#dc2626;--purple:#7c3aed;--accent:#2563eb;--teal:#0d9488;
+  --glow-blue:rgba(37,99,235,.06);--glow-green:rgba(22,163,74,.06);
 }
 body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);display:flex;height:100vh;overflow:hidden}
 
@@ -1249,6 +1276,7 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
 
 <div id="sidebar">
   <div id="sidebar-head">🦞 Agents</div>
+  <!-- sidebar-head text is updated dynamically by toggleLang/init -->
   <div id="agent-list"></div>
 </div>
 
@@ -1256,20 +1284,23 @@ body{background:var(--bg);color:var(--text);font:13px/1.6 var(--font-sans);displ
   <div id="topbar">
     <button id="sidebar-toggle" class="sidebar-toggle-btn" onclick="toggleSidebar()" title="Toggle sidebar">☰</button>
     <button id="back-btn" class="back-btn" onclick="goHome()" style="display:none" title="Back to overview">←</button>
-    <span id="agent-title" style="cursor:pointer" onclick="if(selectedId)goHome()">OpenClaw Trace</span>
+    <span id="agent-title" style="cursor:pointer" onclick="if(selectedId)goHome()"></span>
     <span id="pill-model" class="pill model" style="display:none"></span>
     <span id="pill-ctx"   class="pill"       style="display:none"></span>
     <div id="budget-wrap"                     style="display:none">
       <div id="budget-label"><span class="lbl"></span><span class="proj"></span></div>
       <div id="budget-track"><div id="budget-fill"></div></div>
     </div>
+    <button id="lang-btn" class="compare-mode-btn" onclick="toggleLang()">中</button>
+    <button id="theme-btn" class="compare-mode-btn" onclick="toggleTheme()">☀</button>
+    <button id="display-mode-btn" class="compare-mode-btn" onclick="toggleDisplayMode()">Token</button>
     <button id="compare-mode-btn" class="compare-mode-btn" onclick="toggleCompareMode()" style="display:none">Compare</button>
     <div id="daily-pill"><span class="amt"></span> <span class="m"></span></div>
   </div>
-  <div id="content"><div class="empty">← select an agent</div></div>
+  <div id="content"><div class="empty"></div></div>
 </div>
 
-<div id="refresh">● auto-refresh 5s</div>
+<div id="refresh"></div>
 
 
 <script>
@@ -1280,6 +1311,257 @@ const expandedSteps = {};
 let compareMode = false;
 let compareHbs = []; // [hbIdx1, hbIdx2]
 let agentOverviewOpen = true;
+let displayMode = localStorage.getItem('displayMode') || 'cost'; // 'cost' | 'token'
+let theme = localStorage.getItem('theme') || 'dark'; // 'dark' | 'light'
+if (theme === 'light') document.documentElement.classList.add('light');
+
+// ── i18n ──────────────────────────────────────────────────────────────────────
+const I18N = {
+  en: {
+    agents: 'Agents',
+    openclawTrace: 'OpenClaw Trace',
+    toggleSidebar: 'Toggle sidebar',
+    backToOverview: 'Back to overview',
+    compare: 'Compare',
+    exitCompare: 'Exit Compare',
+    allAgents: 'All agents',
+    agent: 'Agent',
+    health: 'Health',
+    heartbeats: 'Heartbeats',
+    avgCostPerHb: 'Avg $/hb',
+    avgTokPerHb: 'Avg tok/hb',
+    sessionCost: 'Session cost',
+    sessionTokens: 'Session tokens',
+    lastRun: 'Last run',
+    costByAgent: 'Cost',
+    tokensByAgent: 'Tokens',
+    byAgentSuffix: 'by agent (session)',
+    sevenDaySpend: '7-day spend',
+    sevenDayTokens: '7-day tokens',
+    activityByHour: 'Activity by hour (today)',
+    sessionOverview: 'Session overview',
+    avgCostHb: 'Avg cost / hb',
+    avgTokHb: 'Avg tok / hb',
+    cacheHitRate: 'Cache hit rate',
+    costPerHb: 'Cost per heartbeat',
+    tokensPerHb: 'Tokens per heartbeat',
+    contextGrowth: 'Context growth over heartbeats',
+    costPerStep: '💰 Cost per step',
+    tokensPerStep: '🔢 Tokens per step',
+    toolUsage: '🔧 Tool usage',
+    costBreakdown: '📊 Cost breakdown',
+    tokenBreakdown: '📊 Token breakdown',
+    input: 'Input',
+    output: 'Output',
+    cacheRead: 'Cache read',
+    cacheWrite: 'Cache write',
+    toolResults: 'Tool results',
+    total: 'Total',
+    time: 'Time',
+    dur: 'Dur',
+    action: 'Action',
+    result: 'Result',
+    outTok: 'Out tok',
+    cacheR: 'Cache R',
+    ctx: 'Ctx',
+    cost: 'Cost',
+    tokens: 'Tokens',
+    thinking: 'Thinking',
+    thinkingLabel: '💭 Thinking',
+    noToolCalls: 'No tool calls — model reasoning step',
+    noSteps: 'No steps',
+    noHeartbeats: 'No heartbeats recorded yet',
+    selectAgent: '← select an agent',
+    noData: 'No data',
+    noCostData: 'No cost data',
+    noTrendData: 'No trend data',
+    noToolsUsed: 'No tools used',
+    noDurationData: 'No duration data',
+    session1: 'Session 1',
+    session2Delta: 'Session 2 (delta)',
+    steps: 'Steps',
+    context: 'Context',
+    cacheHit: 'Cache hit',
+    duration: 'Duration',
+    errors: 'Errors',
+    errorLog: 'Error Log',
+    noErrors: 'No errors',
+    noErrorsToday: 'No errors today',
+    actionsFeed: 'Actions feed (today)',
+    all: 'All',
+    browser: 'Browser',
+    files: 'Files',
+    shell: 'Shell',
+    other: 'Other',
+    noActionsRecorded: 'No actions recorded',
+    cleanupHeartbeats: '🗑 Cleanup heartbeats',
+    cleanupConfirm: 'Delete all {count} heartbeat sessions for {name}?\\n\\nThis cannot be undone.',
+    today: 'Today',
+    yesterday: 'Yesterday',
+    hbHealthTimeline: 'Heartbeat health timeline (today)',
+    ok: 'ok',
+    warn: 'warn',
+    err: 'err',
+    error: 'ERROR',
+    solved: '✓ SOLVED',
+    markSolved: 'Mark as solved',
+    markAllSolved: '✓ All',
+    compareMode: 'Compare mode:',
+    select1st: 'Select 1st',
+    select2nd: 'Select 2nd',
+    clear: 'Clear',
+    autoRefresh: '● auto-refresh 5s',
+    refreshed: '● refreshed',
+    loading: '⟳ loading…',
+    budget: 'Budget',
+    api: 'API',
+    tool: 'Tool',
+    system: 'System',
+    hb: 'hb',
+    cache: 'cache',
+    cached: 'cached',
+    perHeartbeat: 'per heartbeat',
+    step: 'step',
+    todayLabel: 'today',
+    cleanupFailed: 'Cleanup failed: ',
+    markAllTitle: 'Mark all errors in this heartbeat as solved',
+    copyApiAll: 'Copy API URL (all steps)',
+    copyApiErrors: 'Copy API URL (errors only)',
+    clickRowFull: 'Click row to see full text',
+    optimizationHints: '⚠ Optimization hints',
+    yest: 'Yest',
+    model: 'Model',
+  },
+  zh: {
+    agents: '代理',
+    openclawTrace: 'OpenClaw Trace',
+    toggleSidebar: '切换侧边栏',
+    backToOverview: '返回概览',
+    compare: '对比',
+    exitCompare: '退出对比',
+    allAgents: '所有代理',
+    agent: '代理',
+    health: '健康',
+    heartbeats: '心跳',
+    avgCostPerHb: '均$/hb',
+    avgTokPerHb: '均tok/hb',
+    sessionCost: '会话花费',
+    sessionTokens: '会话 Token',
+    lastRun: '最近运行',
+    costByAgent: '花费',
+    tokensByAgent: 'Token',
+    byAgentSuffix: '按代理（会话）',
+    sevenDaySpend: '7日花费',
+    sevenDayTokens: '7日 Token',
+    activityByHour: '按小时活跃度（今日）',
+    sessionOverview: '会话概览',
+    avgCostHb: '均花费 / hb',
+    avgTokHb: '均 tok / hb',
+    cacheHitRate: '缓存命中率',
+    costPerHb: '每次心跳花费',
+    tokensPerHb: '每次心跳 Token',
+    contextGrowth: '上下文增长趋势',
+    costPerStep: '💰 每步花费',
+    tokensPerStep: '🔢 每步 Token',
+    toolUsage: '🔧 工具使用',
+    costBreakdown: '📊 花费明细',
+    tokenBreakdown: '📊 Token 明细',
+    input: '输入',
+    output: '输出',
+    cacheRead: '缓存读取',
+    cacheWrite: '缓存写入',
+    toolResults: '工具结果',
+    total: '合计',
+    time: '时间',
+    dur: '时长',
+    action: '操作',
+    result: '结果',
+    outTok: '输出 tok',
+    cacheR: '缓存读',
+    ctx: '上下文',
+    cost: '花费',
+    tokens: 'Token',
+    thinking: '思考',
+    thinkingLabel: '💭 思考',
+    noToolCalls: '无工具调用 — 模型推理步骤',
+    noSteps: '无步骤',
+    noHeartbeats: '尚无心跳记录',
+    selectAgent: '← 选择一个代理',
+    noData: '无数据',
+    noCostData: '无花费数据',
+    noTrendData: '无趋势数据',
+    noToolsUsed: '未使用工具',
+    noDurationData: '无时长数据',
+    session1: '会话 1',
+    session2Delta: '会话 2（差异）',
+    steps: '步骤',
+    context: '上下文',
+    cacheHit: '缓存命中',
+    duration: '时长',
+    errors: '错误',
+    errorLog: '错误日志',
+    noErrors: '无错误',
+    noErrorsToday: '今日无错误',
+    actionsFeed: '操作流（今日）',
+    all: '全部',
+    browser: '浏览器',
+    files: '文件',
+    shell: '命令行',
+    other: '其他',
+    noActionsRecorded: '无操作记录',
+    cleanupHeartbeats: '🗑 清理心跳',
+    cleanupConfirm: '删除 {name} 的全部 {count} 条心跳会话？\\n\\n此操作不可撤销。',
+    today: '今天',
+    yesterday: '昨天',
+    hbHealthTimeline: '心跳健康时间线（今日）',
+    ok: '正常',
+    warn: '警告',
+    err: '错误',
+    error: '错误',
+    solved: '✓ 已解决',
+    markSolved: '标记已解决',
+    markAllSolved: '✓ 全部',
+    compareMode: '对比模式：',
+    select1st: '选择第1项',
+    select2nd: '选择第2项',
+    clear: '清除',
+    autoRefresh: '● 自动刷新 5秒',
+    refreshed: '● 已刷新',
+    loading: '⟳ 加载中…',
+    budget: '预算',
+    api: 'API',
+    tool: '工具',
+    system: '系统',
+    hb: 'hb',
+    cache: '缓存',
+    cached: '缓存',
+    perHeartbeat: '每次心跳',
+    step: '步骤',
+    todayLabel: '今日',
+    cleanupFailed: '清理失败：',
+    markAllTitle: '标记此心跳中的所有错误为已解决',
+    copyApiAll: '复制 API URL（全部步骤）',
+    copyApiErrors: '复制 API URL（仅错误）',
+    clickRowFull: '点击行查看完整文本',
+    optimizationHints: '⚠ 优化提示',
+    yest: '昨',
+    model: '模型',
+  }
+};
+let lang = localStorage.getItem('lang') || 'en';
+const t = key => (I18N[lang] && I18N[lang][key]) || I18N.en[key] || key;
+function trendLabel(d) {
+  if (d.dayOffset === 0) return t('today');
+  if (d.dayOffset === 1) return t('yest');
+  if (d.date) { const dt = new Date(d.date+'T12:00:00'); return dt.toLocaleDateString(lang==='zh'?'zh-CN':'en',{weekday:'short'}).slice(0,3); }
+  return d.label;
+}
+function dailyLabel(d) {
+  if (d.dayOffset === 0) return t('today');
+  if (d.dayOffset === 1) return t('yesterday');
+  if (d.date) { const dt = new Date(d.date+'T12:00:00'); return dt.toLocaleDateString(lang==='zh'?'zh-CN':'en',{weekday:'short'}); }
+  return d.label;
+}
 
 // ── Solved Errors Tracking ────────────────────────────────────────────────────
 // Store solved errors by agentId:hbStartTime:stepIdx:resultIdx
@@ -1393,6 +1675,9 @@ function hasErrorInResult(toolResult) {
 
 // ── Formatters ────────────────────────────────────────────────────────────────
 const f$  = n => '$' + (+n||0).toFixed(4);
+const fTk = n => { n = +n || 0; if (n >= 1e9) return (n/1e9).toFixed(1) + 'G'; if (n >= 1e6) return (n/1e6).toFixed(1) + 'M'; if (n >= 1e3) return (n/1e3).toFixed(1) + 'K'; return n.toString(); };
+const dVal = (costVal, tokenVal) => displayMode === 'cost' ? costVal : tokenVal;
+const dFmt = (costVal, tokenVal) => displayMode === 'cost' ? f$(costVal) : fTk(tokenVal);
 const fN  = n => (+n||0).toLocaleString();
 const fT  = ts => ts ? new Date(ts).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit',second:'2-digit'}) : '—';
 const fD  = ms => { if(!ms) return '—'; const s=Math.round(ms/1000); return s<60?s+'s':s<3600?Math.floor(s/60)+'m':Math.floor(s/3600)+'h'; };
@@ -1420,8 +1705,8 @@ function svgBars(vals, h, color, tipFn) {
   const grid = Array.from({length: ySteps + 1}, (_, i) => {
     const v = maxV * (1 - i / ySteps);
     const y = padT + (i * chartH / ySteps);
-    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
-      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${f$(v)}</text>\`;
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="var(--border)" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="var(--muted2)" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${displayMode==='cost'?f$(v):fTk(v)}</text>\`;
   }).join('');
 
   const bars = vals.map((v, i) => {
@@ -1431,8 +1716,8 @@ function svgBars(vals, h, color, tipFn) {
     const opacity = 0.5 + 0.5 * (v / maxV);
     return \`<g>
       <rect x="\${x}" y="\${y}" width="\${barW}" height="\${bh}" fill="\${color}" rx="3" opacity="\${opacity.toFixed(2)}"><title>\${tipFn ? tipFn(v, i) : v}</title></rect>
-      <text x="\${x + barW / 2}" y="\${y - 4}" fill="#94a3b8" font-size="8" text-anchor="middle" font-family="var(--font-mono)">\${f$(v)}</text>
-      <text x="\${x + barW / 2}" y="\${h - 6}" fill="#475569" font-size="9" text-anchor="middle">#\${i + 1}</text>
+      <text x="\${x + barW / 2}" y="\${y - 4}" fill="var(--chart-label)" font-size="8" text-anchor="middle" font-family="var(--font-mono)">\${displayMode==='cost'?f$(v):fTk(v)}</text>
+      <text x="\${x + barW / 2}" y="\${h - 6}" fill="var(--muted2)" font-size="9" text-anchor="middle">#\${i + 1}</text>
     </g>\`;
   }).join('');
 
@@ -1453,8 +1738,8 @@ function svgLine(vals, h, color) {
   const grid = Array.from({length: ySteps + 1}, (_, i) => {
     const v = maxV - (i / ySteps) * range;
     const y = padT + (i * chartH / ySteps);
-    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
-      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${fN(Math.round(v))}</text>\`;
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="var(--border)" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="var(--muted2)" font-size="9" text-anchor="end" font-family="var(--font-mono)">\${fN(Math.round(v))}</text>\`;
   }).join('');
 
   // Data points + line
@@ -1472,13 +1757,13 @@ function svgLine(vals, h, color) {
   const dots = points.map((p, i) => {
     const showLabel = i === 0 || i === n - 1 || p.v === maxV;
     return \`<circle cx="\${p.x}" cy="\${p.y}" r="3.5" fill="\${color}" stroke="var(--surface)" stroke-width="2"><title>#\${i + 1}: \${fN(Math.round(p.v))}</title></circle>
-      \${showLabel ? \`<text x="\${p.x}" y="\${p.y - 8}" fill="#94a3b8" font-size="9" text-anchor="middle" font-family="var(--font-mono)">\${fN(Math.round(p.v))}</text>\` : ''}
+      \${showLabel ? \`<text x="\${p.x}" y="\${p.y - 8}" fill="var(--chart-label)" font-size="9" text-anchor="middle" font-family="var(--font-mono)">\${fN(Math.round(p.v))}</text>\` : ''}
     \`;
   }).join('');
 
   // X-axis labels
   const xLabels = points.map((p, i) =>
-    \`<text x="\${p.x}" y="\${h - 6}" fill="#475569" font-size="9" text-anchor="middle">#\${i + 1}</text>\`
+    \`<text x="\${p.x}" y="\${h - 6}" fill="var(--muted2)" font-size="9" text-anchor="middle">#\${i + 1}</text>\`
   ).join('');
 
   return \`<svg viewBox="0 0 \${W} \${h}" width="100%" height="\${h}" style="display:block">
@@ -1498,14 +1783,14 @@ function svgToolBreakdown(steps) {
     }
   }
   const entries = Object.entries(toolCounts).sort((a,b) => b[1] - a[1]).slice(0, 5);
-  if (!entries.length) return '<div class="m" style="padding:20px;text-align:center;font-size:10px">No tools used</div>';
+  if (!entries.length) return '<div class="m" style="padding:20px;text-align:center;font-size:10px">'+t('noToolsUsed')+'</div>';
 
   const maxCount = Math.max(...entries.map(e => e[1]));
-  const colors = {browser:'#60a5fa',read:'#2dd4bf',write:'#2dd4bf',edit:'#2dd4bf',bash:'#fbbf24',grep:'#a78bfa',glob:'#a78bfa'};
+  const colors = {browser:'var(--blue)',read:'var(--teal)',write:'var(--teal)',edit:'var(--teal)',bash:'var(--orange)',grep:'var(--purple)',glob:'var(--purple)'};
 
   return entries.map(([tool, count]) => {
     const pct = Math.round((count / maxCount) * 100);
-    const color = colors[tool] || '#64748b';
+    const color = colors[tool] || 'var(--muted)';
     return \`<div style="margin-bottom:6px">
       <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px">
         <span style="color:var(--text);font-weight:500">\${tool}</span>
@@ -1527,7 +1812,7 @@ function svgDurationBreakdown(steps) {
   })).filter(s => s.duration > 0).sort((a, b) => b.duration - a.duration).slice(0, 5);
 
   if (!stepDurations.length) {
-    return '<div class="m" style="padding:20px;text-align:center;font-size:10px">No duration data</div>';
+    return '<div class="m" style="padding:20px;text-align:center;font-size:10px">'+t('noDurationData')+'</div>';
   }
 
   const maxDuration = Math.max(...stepDurations.map(s => s.duration));
@@ -1541,7 +1826,7 @@ function svgDurationBreakdown(steps) {
         <span style="color:var(--muted)">\${fD(step.duration)}</span>
       </div>
       <div style="height:6px;background:var(--border);border-radius:3px;overflow:hidden">
-        <div style="width:\${pct}%;height:100%;background:#fbbf24;transition:width .3s"></div>
+        <div style="width:\${pct}%;height:100%;background:var(--orange);transition:width .3s"></div>
       </div>
     </div>\`;
   }).join('');
@@ -1552,23 +1837,26 @@ const CHART_H = 180; // consistent height across all 3 charts
 
 // ── Chart 1: Cost by Agent (horizontal bar) ─────────────────────────────────
 function svgCostByAgent(agents) {
-  const sorted = agents.filter(a => a.totalCost > 0).sort((a,b) => b.totalCost - a.totalCost);
-  if (!sorted.length) return '<div class="m" style="padding:20px;text-align:center">No cost data</div>';
-  const maxCost = sorted[0].totalCost;
-  const totalCost = agents.reduce((s,x) => s + x.totalCost, 0);
+  const valFn = a => dVal(a.totalCost, a.totalTokensSum || 0);
+  const sorted = agents.filter(a => valFn(a) > 0).sort((a,b) => valFn(b) - valFn(a));
+  if (!sorted.length) return '<div class="m" style="padding:20px;text-align:center">No data</div>';
+  const maxVal = valFn(sorted[0]);
+  const totalVal = agents.reduce((s,x) => s + valFn(x), 0);
   const n = sorted.length;
   const barH = Math.min(22, Math.floor((CHART_H - 4) / n) - 4);
   const gap = Math.min(4, Math.floor((CHART_H - n * barH) / Math.max(n - 1, 1)));
   const labelW = 80, chartW = 180, valW = 100;
   const totalW = labelW + chartW + valW;
   const bars = sorted.map((a, i) => {
+    const v = valFn(a);
     const y = i * (barH + gap) + 2;
-    const w = Math.max(2, (a.totalCost / maxCost) * chartW);
-    const share = totalCost > 0 ? ((a.totalCost / totalCost) * 100).toFixed(0) + '%' : '';
+    const w = Math.max(2, (v / maxVal) * chartW);
+    const share = totalVal > 0 ? ((v / totalVal) * 100).toFixed(0) + '%' : '';
+    const label = dFmt(a.totalCost, a.totalTokensSum || 0);
     return \`<g>
-      <text x="\${labelW - 6}" y="\${y + barH/2 + 4}" fill="#e2e8f0" font-size="11" text-anchor="end">\${esc(a.emoji)} \${esc(a.name.replace(' Promo',''))}</text>
-      <rect x="\${labelW}" y="\${y}" width="\${w.toFixed(1)}" height="\${barH}" rx="3" fill="#60a5fa" opacity="0.8"><title>\${a.emoji} \${a.name}: \${f$(a.totalCost)}</title></rect>
-      <text x="\${labelW + w + 6}" y="\${y + barH/2 + 4}" fill="#94a3b8" font-size="10">\${f$(a.totalCost)} <tspan fill="#475569">\${share}</tspan></text>
+      <text x="\${labelW - 6}" y="\${y + barH/2 + 4}" fill="var(--text)" font-size="11" text-anchor="end">\${esc(a.emoji)} \${esc(a.name.replace(' Promo',''))}</text>
+      <rect x="\${labelW}" y="\${y}" width="\${w.toFixed(1)}" height="\${barH}" rx="3" fill="var(--blue)" opacity="0.8"><title>\${a.emoji} \${a.name}: \${label}</title></rect>
+      <text x="\${labelW + w + 6}" y="\${y + barH/2 + 4}" fill="var(--chart-label)" font-size="10">\${label} <tspan fill="var(--muted2)">\${share}</tspan></text>
     </g>\`;
   }).join('');
   return \`<svg width="100%" viewBox="0 0 \${totalW} \${CHART_H}" style="display:block">\${bars}</svg>\`;
@@ -1576,34 +1864,37 @@ function svgCostByAgent(agents) {
 
 // ── Chart 2: 7-Day Daily Spend (vertical bar) ──────────────────────────────
 function svgDailySpend(trendData) {
-  if (!trendData || trendData.length < 1) return '<div class="m" style="padding:20px;text-align:center">No trend data</div>';
+  if (!trendData || trendData.length < 1) return '<div class="m" style="padding:20px;text-align:center">'+t('noTrendData')+'</div>';
   const W = 360, padL = 45, padR = 10, padT = 16, padB = 28;
   const chartW = W - padL - padR, chartH = CHART_H - padT - padB;
   const n = trendData.length;
-  const maxV = Math.max(...trendData.map(d => d.total), 0.01);
+  const vals = trendData.map(d => dVal(d.total, d.tokens || 0));
+  const maxV = Math.max(...vals, 0.01);
   const barW = Math.min(36, Math.floor(chartW / n) - 8);
   const gap = (chartW - n * barW) / (n + 1);
+  const fmtV = v => displayMode === 'cost' ? f$(v) : fTk(v);
 
   // Grid lines
   const ySteps = 3;
   const gridLines = Array.from({length: ySteps + 1}, (_, i) => {
     const v = maxV * (1 - i / ySteps);
     const y = padT + (i * chartH / ySteps);
-    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="#1e2535" stroke-width="1"/>
-      <text x="\${padL - 6}" y="\${y + 3}" fill="#475569" font-size="9" text-anchor="end">\${f$(v)}</text>\`;
+    return \`<line x1="\${padL}" y1="\${y}" x2="\${W - padR}" y2="\${y}" stroke="var(--border)" stroke-width="1"/>
+      <text x="\${padL - 6}" y="\${y + 3}" fill="var(--muted2)" font-size="9" text-anchor="end">\${fmtV(v)}</text>\`;
   }).join('');
 
   const bars = trendData.map((d, i) => {
+    const v = vals[i];
     const x = padL + gap + i * (barW + gap);
-    const barH = Math.max(1, (d.total / maxV) * chartH);
+    const barH = Math.max(1, (v / maxV) * chartH);
     const y = padT + chartH - barH;
     const isToday = i === n - 1;
-    const color = isToday ? '#60a5fa' : '#60a5fa';
+    const color = 'var(--blue)';
     const opacity = isToday ? '0.9' : '0.45';
     return \`<g>
-      <rect x="\${x}" y="\${y}" width="\${barW}" height="\${barH.toFixed(1)}" rx="3" fill="\${color}" opacity="\${opacity}"><title>\${esc(d.label)}: \${f$(d.total)}</title></rect>
-      <text x="\${x + barW/2}" y="\${y - 4}" fill="#94a3b8" font-size="9" text-anchor="middle">\${f$(d.total)}</text>
-      <text x="\${x + barW/2}" y="\${CHART_H - 6}" fill="#475569" font-size="9" text-anchor="middle">\${esc(d.label)}</text>
+      <rect x="\${x}" y="\${y}" width="\${barW}" height="\${barH.toFixed(1)}" rx="3" fill="\${color}" opacity="\${opacity}"><title>\${esc(trendLabel(d))}: \${fmtV(v)}</title></rect>
+      <text x="\${x + barW/2}" y="\${y - 4}" fill="var(--chart-label)" font-size="9" text-anchor="middle">\${fmtV(v)}</text>
+      <text x="\${x + barW/2}" y="\${CHART_H - 6}" fill="var(--muted2)" font-size="9" text-anchor="middle">\${esc(trendLabel(d))}</text>
     </g>\`;
   }).join('');
 
@@ -1619,7 +1910,7 @@ function svgHourlyActivity(agents) {
       if (!hb.startTime) continue;
       const h = new Date(hb.startTime).getHours();
       hourBuckets[h]++;
-      hourCosts[h] += hb.totalCost || 0;
+      hourCosts[h] += dVal(hb.totalCost || 0, hb.totalTokensSum || 0);
     }
   }
   const maxCount = Math.max(...hourBuckets, 1);
@@ -1631,12 +1922,12 @@ function svgHourlyActivity(agents) {
     const barH = Math.max(1, (count / maxCount) * chartH);
     const y = padT + chartH - barH;
     const opacity = count > 0 ? 0.4 + 0.6 * (count / maxCount) : 0.15;
-    const color = count > 0 ? '#60a5fa' : '#1e2535';
-    const tip = \`\${String(h).padStart(2,'0')}:00 — \${count} heartbeats, \${f$(hourCosts[h])}\`;
+    const color = count > 0 ? 'var(--blue)' : 'var(--border)';
+    const tip = \`\${String(h).padStart(2,'0')}:00 — \${count} \${t('heartbeats')}, \${displayMode === 'cost' ? f$(hourCosts[h]) : fTk(hourCosts[h])}\`;
     return \`<g>
       <rect x="\${x}" y="\${y}" width="\${barW}" height="\${barH.toFixed(1)}" rx="2" fill="\${color}" opacity="\${opacity.toFixed(2)}"><title>\${esc(tip)}</title></rect>
-      \${count > 0 ? \`<text x="\${x + barW/2}" y="\${y - 3}" fill="#64748b" font-size="8" text-anchor="middle">\${count}</text>\` : ''}
-      \${h % 3 === 0 ? \`<text x="\${x + barW/2}" y="\${CHART_H - 4}" fill="#475569" font-size="9" text-anchor="middle">\${String(h).padStart(2,'0')}</text>\` : ''}
+      \${count > 0 ? \`<text x="\${x + barW/2}" y="\${y - 3}" fill="var(--muted)" font-size="8" text-anchor="middle">\${count}</text>\` : ''}
+      \${h % 3 === 0 ? \`<text x="\${x + barW/2}" y="\${CHART_H - 4}" fill="var(--muted2)" font-size="9" text-anchor="middle">\${String(h).padStart(2,'0')}</text>\` : ''}
     </g>\`;
   }).join('');
   return \`<svg width="100%" viewBox="0 0 \${W} \${CHART_H}" style="display:block">\${bars}</svg>\`;
@@ -1719,14 +2010,14 @@ function renderSidebar() {
   document.getElementById('agent-list').innerHTML = agents.map(a => {
     const last = a.heartbeats?.[0];
     const cls  = a.id===selectedId ? 'active' : '';
-    const cost = last ? f$(last.totalCost) : '—';
+    const cost = last ? dFmt(last.totalCost, last.totalTokensSum) : '—';
     const ago  = fAgo(a.lastTime);
     const hbn  = a.heartbeats?.length||0;
     const errBadge = a.totalErrors ? \`<span class="err-count">⚠\${a.totalErrors}</span>\` : '';
 
     // Live status dot
     const ageMs = a.lastTime ? Date.now() - a.lastTime : Infinity;
-    const dotColor = ageMs < 900000 ? '#4ade80' : ageMs < 3600000 ? '#fbbf24' : '#1e2535'; // 15min green, 1hr yellow, else grey
+    const dotColor = ageMs < 900000 ? 'var(--green)' : ageMs < 3600000 ? 'var(--orange)' : 'var(--border)'; // 15min green, 1hr yellow, else grey
     const liveDot = \`<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:\${dotColor};margin-right:4px"></span>\`;
 
     return \`<div class="agent-row \${cls}" onclick="select('\${a.id}')">
@@ -1746,7 +2037,7 @@ function renderCrossAgentView() {
 
   // Hide compare button in cross-agent view
   document.getElementById('compare-mode-btn').style.display = 'none';
-  document.getElementById('agent-title').textContent = 'OpenClaw Trace';
+  document.getElementById('agent-title').textContent = t('openclawTrace');
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
 
@@ -1763,23 +2054,24 @@ function renderCrossAgentView() {
 
   const rows = agents.map(a => {
     const hbs = a.heartbeats?.length || 0;
-    const avg = hbs ? a.totalCost / hbs : 0;
+    const avgCost = hbs ? a.totalCost / hbs : 0;
+    const avgTokens = hbs ? (a.totalTokensSum || 0) / hbs : 0;
     const errBadge = a.totalErrors ? \`<span class="err-count">⚠\${a.totalErrors}</span>\` : '';
     const hbList = (a.heartbeats || []).slice().reverse();
     const dots = hbList.map(hb => {
       const errs = hb.errorCount || 0;
       const waste = (hb.wasteFlags || []).length;
       const cls = errs > 0 ? 'red' : waste > 0 ? 'yellow' : 'green';
-      const t = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
-      const tip = t + ' · ' + (errs ? errs+' err' : waste ? waste+' warn' : 'ok') + ' · ' + f$(hb.totalCost);
+      const tm = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
+      const tip = tm + ' · ' + (errs ? errs+' '+t('err') : waste ? waste+' '+t('warn') : t('ok')) + ' · ' + dFmt(hb.totalCost, hb.totalTokensSum);
       return \`<span class="ht-dot \${cls}" title="\${esc(tip)}"></span>\`;
     }).join('');
     return \`<tr onclick="select('\${a.id}')">
       <td><div class="agent-cell">\${a.emoji} \${a.name} \${errBadge}</div></td>
       <td><div class="ht-dots">\${dots}</div></td>
       <td class="r">\${hbs}</td>
-      <td class="r g">\${f$(avg)}</td>
-      <td class="r g">\${f$(a.totalCost)}</td>
+      <td class="r g">\${dFmt(avgCost, avgTokens)}</td>
+      <td class="r g">\${dFmt(a.totalCost, a.totalTokensSum)}</td>
       <td class="m">\${fAgo(a.lastTime)}</td>
     </tr>\`;
   }).join('');
@@ -1787,28 +2079,28 @@ function renderCrossAgentView() {
   return \`
     <div class="charts-row">
       <div class="chart-card">
-        <div class="section-title">Cost by agent (session)</div>
+        <div class="section-title">\${dVal(t('costByAgent'),t('tokensByAgent'))} \${t('byAgentSuffix')}</div>
         \${costChart}
       </div>
       <div class="chart-card">
-        <div class="section-title">7-day spend</div>
+        <div class="section-title">\${dVal(t('sevenDaySpend'),t('sevenDayTokens'))}</div>
         \${dailyChart}
       </div>
       <div class="chart-card">
-        <div class="section-title">Activity by hour (today)</div>
+        <div class="section-title">\${t('activityByHour')}</div>
         \${activityChart}
       </div>
     </div>
-    <div class="section-title">All agents</div>
+    <div class="section-title">\${t('allAgents')}</div>
     <table class="cross-agent-tbl">
       <thead>
         <tr>
-          <th>Agent</th>
-          <th>Health</th>
-          <th class="r">Heartbeats</th>
-          <th class="r">Avg $/hb</th>
-          <th class="r">Session cost</th>
-          <th>Last run</th>
+          <th>\${t('agent')}</th>
+          <th>\${t('health')}</th>
+          <th class="r">\${t('heartbeats')}</th>
+          <th class="r">\${dVal(t('avgCostPerHb'),t('avgTokPerHb'))}</th>
+          <th class="r">\${dVal(t('sessionCost'),t('sessionTokens'))}</th>
+          <th>\${t('lastRun')}</th>
         </tr>
       </thead>
       <tbody>\${rows}</tbody>
@@ -1829,13 +2121,13 @@ function renderHealthTimeline(agents) {
       const errs = hb.errorCount || 0;
       const waste = (hb.wasteFlags || []).length;
       const cls = errs > 0 ? 'red' : waste > 0 ? 'yellow' : 'green';
-      const t = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
-      const tip = t + ' · ' + (errs ? errs+' err' : waste ? waste+' warn' : 'ok') + ' · ' + f\$(hb.totalCost);
+      const tm = hb.startTime ? new Date(hb.startTime).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false}) : '?';
+      const tip = tm + ' · ' + (errs ? errs+' '+t('err') : waste ? waste+' '+t('warn') : t('ok')) + ' · ' + dFmt(hb.totalCost, hb.totalTokensSum);
       return \`<span class="ht-dot \${cls}" title="\${esc(tip)}"></span>\`;
     }).join('');
     const greens = hbs.filter(h=>!h.errorCount && !(h.wasteFlags||[]).length).length;
     const reds = hbs.filter(h=>h.errorCount>0).length;
-    const summary = hbs.length + ' hb' + (reds ? ', ' + reds + ' err' : '');
+    const summary = hbs.length + ' ' + t('hb') + (reds ? ', ' + reds + ' ' + t('err') : '');
     return \`<div class="ht-row">
       <div class="ht-agent" onclick="select('\${a.id}')">\${a.emoji} \${a.name}</div>
       <div class="ht-dots">\${dots}</div>
@@ -1844,7 +2136,7 @@ function renderHealthTimeline(agents) {
   }).filter(Boolean).join('');
   if (!rows) return '';
   return \`<div class="health-timeline">
-    <div class="section-title">Heartbeat health timeline (today)</div>
+    <div class="section-title">\${t('hbHealthTimeline')}</div>
     \${rows}
   </div>\`;
 }
@@ -1918,7 +2210,7 @@ function renderErrorPanel(agents) {
   const expanded = hasErrors; // auto-expand if errors exist
 
   const agentIds = [...new Set(allErrors.map(e => e.agentId).filter(Boolean))];
-  const agentBtns = [\`<span class="error-filter-btn \${errorFilterAgent==='all'?'active':''}" onclick="filterErrors('all')">All</span>\`]
+  const agentBtns = [\`<span class="error-filter-btn \${errorFilterAgent==='all'?'active':''}" onclick="filterErrors('all')">\${t('all')}</span>\`]
     .concat(agentIds.map(id => {
       const a = agents.find(x=>x.id===id);
       return \`<span class="error-filter-btn \${errorFilterAgent===id?'active':''}" onclick="filterErrors('\${id}')">\${a?.emoji||''} \${a?.name||id}</span>\`;
@@ -1927,8 +2219,8 @@ function renderErrorPanel(agents) {
   // Count by type
   const typeCounts = {};
   for (const e of allErrors) { typeCounts[e.type||'tool'] = (typeCounts[e.type||'tool'] || 0) + 1; }
-  const typeLabels = { api: 'API', browser: 'Browser', tool: 'Tool', system: 'System' };
-  const typeColors = { api: 'var(--red)', browser: 'var(--orange)', tool: '#eab308', system: 'var(--muted)' };
+  const typeLabels = { api: t('api'), browser: t('browser'), tool: t('tool'), system: t('system') };
+  const typeColors = { api: 'var(--red)', browser: 'var(--orange)', tool: 'var(--orange)', system: 'var(--muted)' };
 
   const typeBtns = Object.entries(typeCounts).map(([type, count]) => {
     const label = typeLabels[type] || type;
@@ -1957,15 +2249,15 @@ function renderErrorPanel(agents) {
 
   return \`<div class="error-panel \${hasErrors?'has-errors':''}">
     <div class="error-header" onclick="toggleErrorPanel()">
-      <span class="error-title">Error Log</span>
+      <span class="error-title">\${t('errorLog')}</span>
       \${hasErrors
-        ? \`<span class="error-badge">\${allErrors.length} error\${allErrors.length>1?'s':''}</span><span class="error-type-counts">\${summaryBadges}</span>\`
-        : \`<span class="error-ok-badge">No errors</span>\`}
+        ? \`<span class="error-badge">\${allErrors.length} \${t('errors')}</span><span class="error-type-counts">\${summaryBadges}</span>\`
+        : \`<span class="error-ok-badge">\${t('noErrors')}</span>\`}
       <span class="hb-arrow" id="error-arrow">\${expanded?'▾':'▸'}</span>
     </div>
     <div class="error-body \${expanded?'open':''}" id="error-body">
       \${hasErrors ? \`<div class="error-filter">\${typeBtns}</div><div class="error-filter">\${agentBtns}</div>\` : ''}
-      \${items || '<div style="padding:10px 12px;color:var(--muted);font-size:10px">No errors today</div>'}
+      \${items || '<div style="padding:10px 12px;color:var(--muted);font-size:10px">'+t('noErrorsToday')+'</div>'}
     </div>
   </div>\`;
 }
@@ -2055,7 +2347,7 @@ function renderActionsFeed(agents) {
   for (const a of allActions) counts[a.type] = (counts[a.type] || 0) + 1;
 
   const types = ['all', 'browser', 'file', 'shell', 'error', 'other'];
-  const labels = { all: 'All', browser: 'Browser', file: 'Files', shell: 'Shell', error: 'Errors', other: 'Other' };
+  const labels = { all: t('all'), browser: t('browser'), file: t('files'), shell: t('shell'), error: t('errors'), other: t('other') };
   const filterBtns = types.filter(t => t === 'all' || counts[t]).map(t => {
     const cnt = t === 'all' ? allActions.length : (counts[t] || 0);
     return \`<span class="af-filter-btn \${actionFilter===t?'active':''}" onclick="filterActions('\${t}')">\${labels[t]} (\${cnt})</span>\`;
@@ -2072,9 +2364,9 @@ function renderActionsFeed(agents) {
   }).join('');
 
   return \`<div class="actions-feed">
-    <div class="section-title">Actions feed (today)</div>
+    <div class="section-title">\${t('actionsFeed')}</div>
     <div class="af-controls">\${filterBtns}</div>
-    <div class="af-list">\${items || '<div style="padding:10px;color:var(--muted);font-size:10px">No actions recorded</div>'}</div>
+    <div class="af-list">\${items || '<div style="padding:10px;color:var(--muted);font-size:10px">'+t('noActionsRecorded')+'</div>'}</div>
   </div>\`;
 }
 
@@ -2101,16 +2393,16 @@ function renderAgent(a) {
   // Show compare mode button
   const compareBtnEl = document.getElementById('compare-mode-btn');
   compareBtnEl.style.display = '';
-  compareBtnEl.textContent = compareMode ? 'Exit Compare' : 'Compare';
+  compareBtnEl.textContent = compareMode ? t('exitCompare') : t('compare');
 
   const el = document.getElementById('content');
   if (!a.heartbeats?.length) {
-    el.innerHTML = '<div class="empty">No heartbeats recorded yet</div>';
+    el.innerHTML = '<div class="empty">'+t('noHeartbeats')+'</div>';
     return;
   }
 
   const hbs   = a.heartbeats;
-  const costs = hbs.slice().reverse().map(h=>h.totalCost);
+  const costs = hbs.slice().reverse().map(h => dVal(h.totalCost, h.totalTokensSum || 0));
   const ctxs  = hbs.slice().reverse().map(h=>h.finalContext);
 
   const cachePct = Math.round((a.avgCacheHit || 0) * 100);
@@ -2123,35 +2415,35 @@ function renderAgent(a) {
     <div class="agent-overview">
       <div class="agent-overview-toggle" onclick="toggleAgentOverview()">
         <span class="toggle-arrow">\${ovArrow}</span>
-        <span class="section-title">Session overview</span>
-        <span style="color:var(--muted);font-size:11px;margin-left:auto">\${f$(a.totalCost)} · \${hbs.length} hb · \${cachePct}% cache</span>
+        <span class="section-title">\${t('sessionOverview')}</span>
+        <span style="color:var(--muted);font-size:11px;margin-left:auto">\${dFmt(a.totalCost, a.totalTokensSum)} · \${hbs.length} \${t('hb')} · \${cachePct}% \${t('cache')}\${displayMode==='cost'?'':\` (\${fTk(a.totalCacheReadTk||0)}/\${fTk((a.totalCacheReadTk||0)+(a.totalInputTk||0))})\`}</span>
       </div>
       <div class="agent-overview-body \${ovState}" style="max-height:\${overviewOpen?'600px':'0'}">
         <div id="overview">
-          <div class="stat-box"><div class="stat-label">Session cost</div><div class="stat-val green">\${f$(a.totalCost)}</div></div>
-          <div class="stat-box"><div class="stat-label">Heartbeats</div><div class="stat-val blue">\${hbs.length}</div></div>
-          <div class="stat-box"><div class="stat-label">Avg cost / hb</div><div class="stat-val orange">\${f$(a.totalCost/hbs.length)}</div></div>
-          <div class="stat-box"><div class="stat-label">Cache hit rate</div><div class="stat-val \${cachePct>70?'green':cachePct>50?'blue':'orange'}">\${cachePct}%</div></div>
-          <div class="stat-box" style="display:flex;align-items:center;justify-content:center"><button class="cleanup-btn" onclick="cleanupAgent('\${a.id}')" style="font-size:10px;padding:6px 12px">🗑 Cleanup heartbeats</button></div>
+          <div class="stat-box"><div class="stat-label">\${dVal(t('sessionCost'),t('sessionTokens'))}</div><div class="stat-val green">\${dFmt(a.totalCost, a.totalTokensSum)}</div></div>
+          <div class="stat-box"><div class="stat-label">\${t('heartbeats')}</div><div class="stat-val blue">\${hbs.length}</div></div>
+          <div class="stat-box"><div class="stat-label">\${dVal(t('avgCostHb'),t('avgTokHb'))}</div><div class="stat-val orange">\${dFmt(a.totalCost/hbs.length, (a.totalTokensSum||0)/hbs.length)}</div></div>
+          <div class="stat-box"><div class="stat-label">\${t('cacheHitRate')}</div><div class="stat-val \${cachePct>70?'green':cachePct>50?'blue':'orange'}">\${cachePct}%</div></div>
+          <div class="stat-box" style="display:flex;align-items:center;justify-content:center"><button class="cleanup-btn" onclick="cleanupAgent('\${a.id}')" style="font-size:10px;padding:6px 12px">\${t('cleanupHeartbeats')}</button></div>
         </div>
         \${compareMode?\`
           <div class="compare-bar">
-            <span class="compare-label">Compare mode:</span>
-            <span class="compare-chip \${compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):'Select 1st'}</span>
+            <span class="compare-label">\${t('compareMode')}</span>
+            <span class="compare-chip \${compareHbs.length>=1?'selected':''}">\${compareHbs[0]!==undefined?'#'+(hbs.length-compareHbs[0]):t('select1st')}</span>
             <span class="m">vs</span>
-            <span class="compare-chip \${compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):'Select 2nd'}</span>
-            \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">Clear</button>\`:''}
+            <span class="compare-chip \${compareHbs.length>=2?'selected':''}">\${compareHbs[1]!==undefined?'#'+(hbs.length-compareHbs[1]):t('select2nd')}</span>
+            \${compareHbs.length===2?\`<button class="compare-btn" onclick="clearCompare()">\${t('clear')}</button>\`:''}
           </div>
         \`:''}
         \${compareHbs.length===2?renderComparison(hbs[compareHbs[0]],hbs[compareHbs[1]]):''}
         <div class="chart-row">
           <div class="chart-box">
-            <div class="section-title">Cost per heartbeat</div>
-            <div class="spark-wrap">\${svgBars(costs,130,'#4ade80',(v,i)=>'#'+(i+1)+' '+f$(v))}</div>
+            <div class="section-title">\${dVal(t('costPerHb'),t('tokensPerHb'))}</div>
+            <div class="spark-wrap">\${svgBars(costs,130,'var(--green)',(v,i)=>'#'+(i+1)+' '+(displayMode==='cost'?f$(v):fTk(v)))}</div>
           </div>
           <div class="chart-box">
-            <div class="section-title">Context growth over heartbeats</div>
-            <div class="spark-wrap">\${svgLine(ctxs,130,'#a78bfa')}</div>
+            <div class="section-title">\${t('contextGrowth')}</div>
+            <div class="spark-wrap">\${svgLine(ctxs,130,'var(--purple)')}</div>
           </div>
         </div>
       </div>
@@ -2164,7 +2456,7 @@ function renderAgent(a) {
 function heartbeatRow(hb, i, total) {
   const isOpen = openHbIdx===i;
   const errBadge = hb.errorCount ? \`<span class="err-count">⚠\${hb.errorCount}</span>\` : '';
-  const markAllBtn = hb.errorCount ? \`<button class="mark-all-solved-btn" onclick="event.stopPropagation(); markAllErrorsSolved(\${i})" title="Mark all errors in this heartbeat as solved">✓ All</button>\` : '';
+  const markAllBtn = hb.errorCount ? \`<button class="mark-all-solved-btn" onclick="event.stopPropagation(); markAllErrorsSolved(\${i})" title="\${t('markAllTitle')}">\${t('markAllSolved')}</button>\` : '';
   const hbId = hb.startTime || i;
   const browserBadge = Object.keys(hb.browserBreakdown||{}).length
     ? \`<span class="hb-browser">\${Object.entries(hb.browserBreakdown).map(([k,v])=>k+'×'+v).join(' ')}</span>\`
@@ -2181,17 +2473,17 @@ function heartbeatRow(hb, i, total) {
     <div class="hb-head \${isOpen?'open':''}" onclick="toggleHb(\${i})" \${hbCls}>
       <span class="hb-num">#\${total-i}</span>
       <span class="hb-time">\${fT(hb.startTime)}</span>
-      <span class="hb-cost">\${f$(hb.totalCost)}</span>
-      <span class="hb-ctx">ctx \${fN(hb.finalContext)}</span>
+      <span class="hb-cost">\${dFmt(hb.totalCost, hb.totalTokensSum)}</span>
+      <span class="hb-ctx">ctx \${fTk(hb.finalContext)}</span>
       <span class="hb-dur">\${fD(hb.durationMs)}</span>
-      <span class="hb-steps">\${hb.steps?.length||0} steps</span>
+      <span class="hb-steps">\${hb.steps?.length||0} \${t('steps')}</span>
       \${errBadge}
       \${markAllBtn}
       \${browserBadge}
       <span class="hb-sum">\${esc(hb.summary||hb.trigger||'')}</span>
       <div class="hb-api-btns" onclick="event.stopPropagation()">
-        <button class="api-btn" onclick="copyApiUrl('\${apiUrl}', this)" title="Copy API URL (all steps)">📋 API</button>
-        <button class="api-btn" onclick="copyApiUrl('\${apiUrlErrors}', this)" title="Copy API URL (errors only)">⚠ API</button>
+        <button class="api-btn" onclick="copyApiUrl('\${apiUrl}', this)" title="\${t('copyApiAll')}">📋 API</button>
+        <button class="api-btn" onclick="copyApiUrl('\${apiUrlErrors}', this)" title="\${t('copyApiErrors')}">⚠ API</button>
       </div>
       <span class="hb-arrow">\${isOpen?'▲':'▼'}</span>
     </div>
@@ -2203,9 +2495,9 @@ function heartbeatRow(hb, i, total) {
 function heartbeatBody(hb, hbIdx) {
   const hbId = hb.startTime || hbIdx;
   const steps = hb.steps||[];
-  if (!steps.length) return '<div class="empty">No steps</div>';
+  if (!steps.length) return '<div class="empty">'+t('noSteps')+'</div>';
 
-  const costs   = steps.map(s=>s.cost||0);
+  const costs   = steps.map(s => dVal(s.cost||0, s.totalTokens||0));
   const ctxs    = steps.map(s=>s.totalTokens||0);
   const avgCost = costs.reduce((a,b)=>a+b,0)/costs.length;
 
@@ -2214,6 +2506,16 @@ function heartbeatBody(hb, hbIdx) {
   const totCR  = steps.reduce((s,x)=>s+(x.costCacheRead||0),0);
   const totCW  = steps.reduce((s,x)=>s+(x.costCacheWrite||0),0);
   const totRes = steps.reduce((s,x)=>s+(x.resultTotalSize||0),0);
+
+  // Token-level totals (reuse heartbeat-level sums from finalizeRun)
+  const tkIn  = hb.totalInput || 0;
+  const tkOut = hb.totalOutput || 0;
+  const tkCR  = hb.totalCacheRead || 0;
+  const tkCW  = hb.totalCacheWrite || 0;
+  const tkTotal = tkIn + tkOut + tkCR + tkCW;
+  const tkPct = v => displayMode==='cost'?'':\` <span class="m">(\${tkTotal>0?Math.round(v/tkTotal*100):0}%)</span>\`;
+  const cachePctTotal = (tkCR+tkIn)>0 ? Math.round(tkCR/(tkCR+tkIn)*100) : 0;
+  const cachedNote = displayMode==='cost'?'':\` <span class="m" style="margin-left:6px">\${cachePctTotal}% \${t('cached')}</span>\`;
   const maxStep = Math.max(...costs, 1e-9);
 
   const open = expandedSteps[hbIdx] || new Set();
@@ -2221,7 +2523,7 @@ function heartbeatBody(hb, hbIdx) {
   // Waste hints
   const wasteHtml = (hb.wasteFlags && hb.wasteFlags.length) ? \`
     <div class="waste-hints">
-      <div class="waste-title"><span class="waste-icon">⚠</span> Optimization hints</div>
+      <div class="waste-title"><span class="waste-icon">⚠</span> \${t('optimizationHints').replace('⚠ ','')}</div>
       <div class="waste-list">
         \${hb.wasteFlags.map(w => \`<div class="waste-item"><span class="waste-icon">•</span><span>\${esc(w.msg)}</span></div>\`).join('')}
       </div>
@@ -2232,28 +2534,28 @@ function heartbeatBody(hb, hbIdx) {
     \${wasteHtml}
     <div class="hb-stats-grid">
       <div class="stat-chart-card">
-        <div class="stat-chart-title">💰 Cost per step</div>
+        <div class="stat-chart-title">\${dVal(t('costPerStep'),t('tokensPerStep'))}</div>
         <div class="stat-chart-content">
-          \${svgBars(costs,130,'#4ade80',(v,i)=>'step '+(i+1)+' '+f$(v))}
+          \${svgBars(costs,130,'var(--green)',(v,i)=>'step '+(i+1)+' '+(displayMode==='cost'?f$(v):fTk(v)))}
         </div>
       </div>
       <div class="stat-chart-card">
-        <div class="stat-chart-title">🔧 Tool usage</div>
+        <div class="stat-chart-title">\${t('toolUsage')}</div>
         <div class="stat-chart-content" style="display:block;overflow-y:auto;max-height:140px">
           \${svgToolBreakdown(steps)}
         </div>
       </div>
       <div class="stat-breakdown-card">
-        <div class="stat-chart-title">📊 Cost breakdown</div>
+        <div class="stat-chart-title">\${dVal(t('costBreakdown'),t('tokenBreakdown'))}</div>
         <div class="breakdown-table">
-          <div class="breakdown-row"><span class="breakdown-label">Input</span><span class="breakdown-value g">\${f$(totIn)}</span></div>
-          <div class="breakdown-row"><span class="breakdown-label">Output</span><span class="breakdown-value g">\${f$(totOut)}</span></div>
-          <div class="breakdown-row"><span class="breakdown-label">Cache read</span><span class="breakdown-value g">\${f$(totCR)}</span></div>
-          <div class="breakdown-row"><span class="breakdown-label">Cache write</span><span class="breakdown-value g">\${f$(totCW)}</span></div>
-          <div class="breakdown-row"><span class="breakdown-label">Tool results</span><span class="breakdown-value b">\${fSz(totRes)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">\${t('input')}</span><span class="breakdown-value g">\${displayMode==='cost'?f$(totIn):fTk(tkIn)}\${tkPct(tkIn)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">\${t('output')}</span><span class="breakdown-value g">\${displayMode==='cost'?f$(totOut):fTk(tkOut)}\${tkPct(tkOut)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">\${t('cacheRead')}</span><span class="breakdown-value g">\${displayMode==='cost'?f$(totCR):fTk(tkCR)}\${tkPct(tkCR)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">\${t('cacheWrite')}</span><span class="breakdown-value g">\${displayMode==='cost'?f$(totCW):fTk(tkCW)}\${tkPct(tkCW)}</span></div>
+          <div class="breakdown-row"><span class="breakdown-label">\${t('toolResults')}</span><span class="breakdown-value b">\${fSz(totRes)}</span></div>
           <div class="breakdown-row breakdown-total">
-            <span class="breakdown-label"><b>Total</b></span>
-            <span class="breakdown-value g"><b>\${f$(hb.totalCost)}</b></span>
+            <span class="breakdown-label"><b>\${t('total')}</b></span>
+            <span class="breakdown-value g"><b>\${dFmt(hb.totalCost, hb.totalTokensSum)}</b>\${cachedNote}</span>
           </div>
         </div>
       </div>
@@ -2262,15 +2564,16 @@ function heartbeatBody(hb, hbIdx) {
       <thead>
         <tr>
           <th>#</th>
-          <th>Time</th>
-          <th class="sortable" onclick="sortSteps(\${hbIdx},'dur')">Dur <span class="sort-arrow" id="sort-dur-\${hbIdx}"></span></th>
-          <th class="sortable" onclick="sortSteps(\${hbIdx},'action')">Action <span class="sort-arrow" id="sort-action-\${hbIdx}"></span></th>
-          <th class="r sortable" onclick="sortSteps(\${hbIdx},'result')">Result <span class="sort-arrow" id="sort-result-\${hbIdx}"></span></th>
-          <th class="r sortable" onclick="sortSteps(\${hbIdx},'output')">Out tok <span class="sort-arrow" id="sort-output-\${hbIdx}"></span></th>
-          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cacheRead')">Cache R <span class="sort-arrow" id="sort-cacheRead-\${hbIdx}"></span></th>
-          <th class="r sortable" onclick="sortSteps(\${hbIdx},'ctx')">Ctx <span class="sort-arrow" id="sort-ctx-\${hbIdx}"></span></th>
-          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cost')">Cost <span class="sort-arrow" id="sort-cost-\${hbIdx}"></span></th>
-          <th>Thinking</th>
+          <th>\${t('model')}</th>
+          <th>\${t('time')}</th>
+          <th class="sortable" onclick="sortSteps(\${hbIdx},'dur')">\${t('dur')} <span class="sort-arrow" id="sort-dur-\${hbIdx}"></span></th>
+          <th class="sortable" onclick="sortSteps(\${hbIdx},'action')">\${t('action')} <span class="sort-arrow" id="sort-action-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'result')">\${t('result')} <span class="sort-arrow" id="sort-result-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'output')">\${t('outTok')} <span class="sort-arrow" id="sort-output-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cacheRead')">\${t('cacheR')} <span class="sort-arrow" id="sort-cacheRead-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'ctx')">\${t('ctx')} <span class="sort-arrow" id="sort-ctx-\${hbIdx}"></span></th>
+          <th class="r sortable" onclick="sortSteps(\${hbIdx},'cost')">\${dVal(t('cost'),t('tokens'))} <span class="sort-arrow" id="sort-cost-\${hbIdx}"></span></th>
+          <th>\${t('thinking')}</th>
         </tr>
       </thead>
       <tbody id="steps-\${hbIdx}">
@@ -2283,7 +2586,8 @@ function heartbeatBody(hb, hbIdx) {
 // ── Step rows (main row + optional detail row) ────────────────────────────────
 function stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open) {
   const isOpen = open.has(si);
-  const heat   = s.cost > avgCost*3 ? 'step-hot' : s.cost > avgCost*1.5 ? 'step-warm' : '';
+  const stepVal = dVal(s.cost||0, s.totalTokens||0);
+  const heat   = stepVal > avgCost*3 ? 'step-hot' : stepVal > avgCost*1.5 ? 'step-warm' : '';
   const expanded = isOpen ? 'expanded' : '';
 
   // Check if this step has unsolved errors
@@ -2296,7 +2600,7 @@ function stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open) {
     });
   };
   const hasError = hasStepError(s.toolResults, hbId, si);
-  const errorBadge = hasError ? '<span class="err-badge" style="margin-left:4px">ERROR</span>' : '';
+  const errorBadge = hasError ? '<span class="err-badge" style="margin-left:4px">'+t('error')+'</span>' : '';
 
   let actionCell = '—';
   if (s.toolCalls?.length) {
@@ -2312,27 +2616,33 @@ function stepRows(s, si, hbIdx, hbId, maxStep, avgCost, open) {
   const thinkingPreview = thinkingText.slice(0, 120);
   const isTruncated = thinkingText.length > 120;
 
+  const sIn = Math.max(0, (s.totalTokens||0) - (s.output||0) - (s.cacheRead||0) - (s.cacheWrite||0));
+  const sCR = s.cacheRead || 0;
+  const sCachePct = (sCR + sIn) > 0 ? Math.round(sCR / (sCR + sIn) * 100) : 0;
+  const ctxTip = \`Input: \${fTk(sIn)} | Cache: \${fTk(sCR)} (\${sCachePct}%) | Out: \${fTk(s.output)}\`;
+
   const mainRow = \`<tr class="step-row \${heat} \${expanded}" onclick="toggleStep(\${hbIdx},\${si})">
     <td class="m">\${si+1}</td>
+    <td class="m" style="font-size:10px;max-width:90px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="\${esc(s.model||'')}">\${fModel(s.model)}</td>
     <td class="m">\${fT(s.time)}</td>
     <td class="m">\${fD(s.durationMs)}</td>
     <td style="max-width:280px">\${actionCell}</td>
     <td class="r b">\${fSz(s.resultTotalSize)}</td>
-    <td class="r o">\${fN(s.output)}</td>
-    <td class="r p">\${fN(s.cacheRead)}</td>
-    <td class="r p">\${fN(s.totalTokens)}</td>
+    <td class="r o">\${fTk(s.output)}</td>
+    <td class="r p">\${fTk(s.cacheRead)}</td>
+    <td class="r p" title="\${ctxTip}">\${fTk(s.totalTokens)}</td>
     <td class="r g">
-      <span class="cost-bar" style="width:\${Math.round((s.cost||0)/maxStep*36)}px"></span>\${f$(s.cost)}
+      <span class="cost-bar" style="width:\${Math.round(stepVal/maxStep*36)}px"></span>\${displayMode==='cost'?f$(s.cost):fTk(s.totalTokens)}
     </td>
     <td class="m thinking-cell" style="max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px\${isTruncated?';cursor:pointer;text-decoration:underline dotted':''}"
-        title="\${isTruncated?'Click row to see full text':''}">
+        title="\${isTruncated?t('clickRowFull'):''}">
       \${thinkingPreview}\${isTruncated?' <span style="color:var(--blue);font-weight:600">↓</span>':''}
     </td>
   </tr>\`;
 
   if (!isOpen) return mainRow;
 
-  return mainRow + \`<tr class="step-detail"><td colspan="10">\${stepDetail(s, hbIdx, hbId, si)}</td></tr>\`;
+  return mainRow + \`<tr class="step-detail"><td colspan="11">\${stepDetail(s, hbIdx, hbId, si)}</td></tr>\`;
 }
 
 // ── Step detail panel ─────────────────────────────────────────────────────────
@@ -2344,7 +2654,7 @@ function stepDetail(s, hbIdx, hbId, stepIdx) {
   // Thinking text section (if present)
   const thinkingHtml = thinkingText ? \`
     <div class="thinking-section">
-      <div class="thinking-label">💭 Thinking</div>
+      <div class="thinking-label">\${t('thinkingLabel')}</div>
       <div class="thinking-text">\${esc(thinkingText)}</div>
     </div>
   \` : '';
@@ -2352,7 +2662,7 @@ function stepDetail(s, hbIdx, hbId, stepIdx) {
   if (!calls.length && !results.length) {
     return \`<div class="step-detail-inner">
       \${thinkingHtml}
-      \${!thinkingText ? '<div class="m" style="font-size:10px;padding:4px">No tool calls — model reasoning step</div>' : ''}
+      \${!thinkingText ? '<div class="m" style="font-size:10px;padding:4px">'+t('noToolCalls')+'</div>' : ''}
     </div>\`;
   }
 
@@ -2424,15 +2734,15 @@ function detailCard(tc, result, hbId, stepIdx, resultIdx) {
     let errBadge = '';
     if (hasError) {
       if (isSolved) {
-        errBadge = \`<span class="err-badge-solved" style="background:#444;color:#888">✓ SOLVED</span>\`;
+        errBadge = \`<span class="err-badge-solved">\${t('solved')}</span>\`;
       } else {
-        errBadge = \`<span class="err-badge">ERROR</span> <button class="mark-solved-btn" onclick="markErrorSolved('\${selectedId}','\${hbId}',\${stepIdx},\${resultIdx})">Mark as solved</button>\`;
+        errBadge = \`<span class="err-badge">\${t('error')}</span> <button class="mark-solved-btn" onclick="markErrorSolved('\${selectedId}','\${hbId}',\${stepIdx},\${resultIdx})">\${t('markSolved')}</button>\`;
       }
     }
 
     resultHtml = \`<div class="detail-result">
       <div class="detail-result-head">
-        <span class="m">result</span>
+        <span class="m">\${t('result')}</span>
         <span class="b">\${fSz(result.size)}</span>
         \${errBadge}
       </div>
@@ -2454,22 +2764,22 @@ function renderComparison(hb1, hb2) {
 
   return \`<div class="compare-view">
     <div class="compare-col">
-      <div class="compare-col-title">Session 1</div>
-      <div class="compare-stat"><span class="lbl">Cost</span><span class="val">\${f$(hb1.totalCost)}</span></div>
-      <div class="compare-stat"><span class="lbl">Steps</span><span class="val">\${hb1.steps?.length||0}</span></div>
-      <div class="compare-stat"><span class="lbl">Context</span><span class="val">\${fN(hb1.finalContext)}</span></div>
-      <div class="compare-stat"><span class="lbl">Cache hit</span><span class="val">\${Math.round((hb1.cacheHitRate||0)*100)}%</span></div>
-      <div class="compare-stat"><span class="lbl">Duration</span><span class="val">\${fD(hb1.durationMs)}</span></div>
-      <div class="compare-stat"><span class="lbl">Errors</span><span class="val">\${hb1.errorCount||0}</span></div>
+      <div class="compare-col-title">\${t('session1')}</div>
+      <div class="compare-stat"><span class="lbl">\${dVal(t('cost'),t('tokens'))}</span><span class="val">\${dFmt(hb1.totalCost, hb1.totalTokensSum)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('steps')}</span><span class="val">\${hb1.steps?.length||0}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('context')}</span><span class="val">\${fN(hb1.finalContext)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('cacheHit')}</span><span class="val">\${Math.round((hb1.cacheHitRate||0)*100)}%</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('duration')}</span><span class="val">\${fD(hb1.durationMs)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('errors')}</span><span class="val">\${hb1.errorCount||0}</span></div>
     </div>
     <div class="compare-col">
-      <div class="compare-col-title">Session 2 (delta)</div>
-      <div class="compare-stat"><span class="lbl">Cost</span><span class="val">\${f$(hb2.totalCost)}\${delta(hb1.totalCost,hb2.totalCost,f$)}</span></div>
-      <div class="compare-stat"><span class="lbl">Steps</span><span class="val">\${hb2.steps?.length||0}\${delta(hb1.steps?.length||0,hb2.steps?.length||0,v=>v)}</span></div>
-      <div class="compare-stat"><span class="lbl">Context</span><span class="val">\${fN(hb2.finalContext)}\${delta(hb1.finalContext,hb2.finalContext,fN)}</span></div>
-      <div class="compare-stat"><span class="lbl">Cache hit</span><span class="val">\${Math.round((hb2.cacheHitRate||0)*100)}%\${delta(Math.round((hb1.cacheHitRate||0)*100),Math.round((hb2.cacheHitRate||0)*100),v=>v+'%')}</span></div>
-      <div class="compare-stat"><span class="lbl">Duration</span><span class="val">\${fD(hb2.durationMs)}</span></div>
-      <div class="compare-stat"><span class="lbl">Errors</span><span class="val">\${hb2.errorCount||0}\${delta(hb1.errorCount||0,hb2.errorCount||0,v=>v)}</span></div>
+      <div class="compare-col-title">\${t('session2Delta')}</div>
+      <div class="compare-stat"><span class="lbl">\${dVal(t('cost'),t('tokens'))}</span><span class="val">\${dFmt(hb2.totalCost, hb2.totalTokensSum)}\${delta(dVal(hb1.totalCost,hb1.totalTokensSum),dVal(hb2.totalCost,hb2.totalTokensSum),displayMode==='cost'?f$:fTk)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('steps')}</span><span class="val">\${hb2.steps?.length||0}\${delta(hb1.steps?.length||0,hb2.steps?.length||0,v=>v)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('context')}</span><span class="val">\${fN(hb2.finalContext)}\${delta(hb1.finalContext,hb2.finalContext,fN)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('cacheHit')}</span><span class="val">\${Math.round((hb2.cacheHitRate||0)*100)}%\${delta(Math.round((hb1.cacheHitRate||0)*100),Math.round((hb2.cacheHitRate||0)*100),v=>v+'%')}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('duration')}</span><span class="val">\${fD(hb2.durationMs)}</span></div>
+      <div class="compare-stat"><span class="lbl">\${t('errors')}</span><span class="val">\${hb2.errorCount||0}\${delta(hb1.errorCount||0,hb2.errorCount||0,v=>v)}</span></div>
     </div>
   </div>\`;
 }
@@ -2494,6 +2804,47 @@ function clearCompare() {
   if (a) renderAgent(a);
 }
 
+function toggleTheme() {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('theme', theme);
+  document.documentElement.classList.toggle('light', theme === 'light');
+  document.getElementById('theme-btn').textContent = theme === 'dark' ? '☀' : '☾';
+}
+
+function toggleLang() {
+  lang = lang === 'en' ? 'zh' : 'en';
+  localStorage.setItem('lang', lang);
+  document.getElementById('lang-btn').textContent = lang === 'en' ? '中' : 'EN';
+  if (selectedId) {
+    const a = DATA?.agents?.find(x => x.id === selectedId);
+    if (a) renderAgent(a);
+  } else {
+    document.getElementById('content').innerHTML = renderCrossAgentView();
+  }
+  renderSidebar();
+  updateDailyPill();
+  updateBudget();
+  document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
+  document.getElementById('refresh').textContent = t('autoRefresh');
+  document.getElementById('sidebar-toggle').title = t('toggleSidebar');
+  document.getElementById('back-btn').title = t('backToOverview');
+}
+
+function toggleDisplayMode() {
+  displayMode = displayMode === 'cost' ? 'token' : 'cost';
+  localStorage.setItem('displayMode', displayMode);
+  document.getElementById('display-mode-btn').textContent = displayMode === 'cost' ? 'Token' : 'Cost';
+  if (selectedId) {
+    const a = DATA?.agents?.find(x => x.id === selectedId);
+    if (a) renderAgent(a);
+  } else {
+    document.getElementById('content').innerHTML = renderCrossAgentView();
+  }
+  renderSidebar();
+  updateDailyPill();
+  updateBudget();
+}
+
 
 // ── URL hash navigation ───────────────────────────────────────────────────────
 function updateHash() {
@@ -2514,7 +2865,7 @@ function goHome(skipPush) {
   if (!skipPush) history.pushState(null, '', window.location.pathname);
   renderSidebar();
   document.getElementById('back-btn').style.display = 'none';
-  document.getElementById('agent-title').textContent = 'OpenClaw Trace';
+  document.getElementById('agent-title').textContent = t('openclawTrace');
   document.getElementById('pill-model').style.display = 'none';
   document.getElementById('pill-ctx').style.display = 'none';
   document.getElementById('compare-mode-btn').style.display = 'none';
@@ -2634,7 +2985,7 @@ function sortSteps(hbIdx, column) {
       case 'output': valA = a.output || 0; valB = b.output || 0; break;
       case 'cacheRead': valA = a.cacheRead || 0; valB = b.cacheRead || 0; break;
       case 'ctx': valA = a.totalTokens || 0; valB = b.totalTokens || 0; break;
-      case 'cost': valA = a.cost || 0; valB = b.cost || 0; break;
+      case 'cost': valA = dVal(a.cost||0, a.totalTokens||0); valB = dVal(b.cost||0, b.totalTokens||0); break;
       default: return 0;
     }
     if (typeof valA === 'string') return newDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
@@ -2720,21 +3071,53 @@ async function cleanupAgent(agentId) {
   const agent = DATA?.agents?.find(a => a.id === agentId);
   const name = agent ? agent.name : agentId;
   const hbCount = agent?.heartbeats?.length || 0;
-  if (!confirm(\`Delete all \${hbCount} heartbeat sessions for \${name}?\\n\\nThis cannot be undone.\`)) return;
+  if (!confirm(t('cleanupConfirm').replace('{count}',hbCount).replace('{name}',name))) return;
   try {
     const r = await fetch(\`/api/cleanup?agent=\${agentId}\`, { method: 'DELETE' });
     const data = await r.json();
     if (data.error) throw new Error(data.error);
     fetchData();
   } catch (e) {
-    alert('Cleanup failed: ' + e.message);
+    alert(t('cleanupFailed') + e.message);
+  }
+}
+
+function updateDailyPill() {
+  if (!DATA) return;
+  const daily = DATA.dailySummary || [];
+  const today = daily.find(d => d.dayOffset === 0);
+  if (today && (today.cost > 0 || today.tokens > 0)) {
+    const pill = document.getElementById('daily-pill');
+    pill.querySelector('.amt').textContent = dFmt(today.cost, today.tokens);
+    pill.querySelector('.m').textContent = t('todayLabel')+' ('+today.hbs+' '+t('hb')+')';
+    pill.style.display = '';
+  }
+}
+
+function updateBudget() {
+  if (!DATA) return;
+  const budget = DATA.budget || {};
+  const bWrap = document.getElementById('budget-wrap');
+  if (displayMode === 'token') {
+    bWrap.style.display = 'none';
+    return;
+  }
+  if (budget.daily && budget.todayCost !== undefined) {
+    const pct = Math.min(100, (budget.todayCost / budget.daily) * 100);
+    const cls = pct > 90 ? 'budget-over' : pct > 70 ? 'budget-warn' : 'budget-ok';
+    bWrap.querySelector('.lbl').textContent = \`\${t('budget')}: \${f$(budget.todayCost)} / \${f$(budget.daily)}\`;
+    bWrap.querySelector('.proj').textContent = \`~\${f$(budget.projectedMonthly)}/mo\`;
+    const bFill = document.getElementById('budget-fill');
+    bFill.style.width = pct + '%';
+    bFill.className = cls;
+    bWrap.style.display = '';
   }
 }
 
 // ── Data fetching ──────────────────────────────────────────────────────────────
 async function fetchData() {
   const el = document.getElementById('refresh');
-  el.className = 'spin'; el.textContent = '⟳ loading…';
+  el.className = 'spin'; el.textContent = t('loading');
   try {
     const r = await fetch('/api/data');
     if (!r.ok) throw new Error('HTTP '+r.status);
@@ -2746,30 +3129,8 @@ async function fetchData() {
     }
 
     renderSidebar();
-
-    // Update daily pill
-    const daily = DATA.dailySummary || [];
-    const today = daily.find(d => d.label === 'Today');
-    if (today && today.cost > 0) {
-      const pill = document.getElementById('daily-pill');
-      pill.querySelector('.amt').textContent = f$(today.cost);
-      pill.querySelector('.m').textContent = 'today ('+today.hbs+' hb)';
-      pill.style.display = '';
-    }
-
-    // Update budget bar
-    const budget = DATA.budget || {};
-    if (budget.daily && budget.todayCost !== undefined) {
-      const pct = Math.min(100, (budget.todayCost / budget.daily) * 100);
-      const cls = pct > 90 ? 'budget-over' : pct > 70 ? 'budget-warn' : 'budget-ok';
-      const bWrap = document.getElementById('budget-wrap');
-      bWrap.querySelector('.lbl').textContent = \`Budget: \${f$(budget.todayCost)} / \${f$(budget.daily)}\`;
-      bWrap.querySelector('.proj').textContent = \`~\${f$(budget.projectedMonthly)}/mo\`;
-      const bFill = document.getElementById('budget-fill');
-      bFill.style.width = pct + '%';
-      bFill.className = cls;
-      bWrap.style.display = '';
-    }
+    updateDailyPill();
+    updateBudget();
 
     // Restore from URL hash if present, otherwise use current state
     const { agent, hb } = parseHash();
@@ -2782,12 +3143,23 @@ async function fetchData() {
       document.getElementById('content').innerHTML = renderCrossAgentView();
     }
     el.className = '';
-    el.textContent = '● refreshed '+new Date().toLocaleTimeString();
+    el.textContent = t('refreshed')+' '+new Date().toLocaleTimeString();
   } catch(e) {
     el.className = '';
     el.textContent = '✕ '+e.message;
   }
 }
+
+// Initialize button texts
+document.getElementById('display-mode-btn').textContent = displayMode === 'cost' ? 'Token' : 'Cost';
+document.getElementById('theme-btn').textContent = theme === 'dark' ? '☀' : '☾';
+document.getElementById('lang-btn').textContent = lang === 'en' ? '中' : 'EN';
+document.getElementById('sidebar-head').textContent = '🦞 ' + t('agents');
+document.getElementById('refresh').textContent = t('autoRefresh');
+document.querySelector('#content .empty').textContent = t('selectAgent');
+document.getElementById('sidebar-toggle').title = t('toggleSidebar');
+document.getElementById('back-btn').title = t('backToOverview');
+document.getElementById('agent-title').textContent = t('openclawTrace');
 
 fetchData();
 setInterval(fetchData, 5000);
